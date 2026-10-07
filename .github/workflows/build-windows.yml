@@ -1,0 +1,64 @@
+# Builds the Windows package (dist/bbport-windows.zip) on GitHub's Windows runner, the same way
+# packaging/windows/README.md describes for a local MSYS2 CLANG64 setup: the port with clang,
+# the DLSS bridge with MSVC (Visual Studio 2022 on the runner) against NVIDIA's DLSS SDK, and the
+# launcher frozen with PyInstaller. The zip is attached to the run as an artifact.
+name: Windows build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [windows, my-build]
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Windows Python for PyInstaller
+        id: python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # The runner's own C:\msys64 (release: false): build_dlss.sh and msys2-env.sh expect it there.
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANG64
+          release: false
+          update: true
+          install: git patch
+          pacboy: >-
+            toolchain:p cmake:p ninja:p pkgconf:p python:p
+            vulkan-headers:p vulkan-loader:p vulkan-memory-allocator:p glslang:p
+            sdl3:p fmt:p boost:p robin-map:p xxhash:p ffmpeg:p zydis:p
+            spirv-tools:p spirv-headers:p spirv-cross:p
+
+      - name: Build the port
+        run: |
+          if ! bash build.sh; then cat out/gpu-build.log | tail -200; exit 1; fi
+
+      - name: NVIDIA DLSS SDK
+        run: git clone --depth 1 https://github.com/NVIDIA/DLSS.git /c/dlss-sdk
+
+      - name: Build the DLSS bridge (MSVC)
+        run: |
+          DLSS_SDK_ROOT=/c/dlss-sdk CMAKE_EXE="/c/Program Files/CMake/bin/cmake.exe" \
+            bash packaging/windows/build_dlss.sh
+
+      - name: Package
+        run: |
+          WINPYTHON="$(cygpath -u '${{ steps.python.outputs.python-path }}')" \
+            bash packaging/windows/package.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bbport-windows
+          path: dist/bbport-windows.zip
+          retention-days: 30
