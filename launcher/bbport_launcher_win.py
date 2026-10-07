@@ -159,7 +159,7 @@ TWEAKS = [
 INI_FLAGS = {'sharpen', 'object_motion', 'show_fps', *(k for k, _t, _o in EFFECTS + EXTRAS + CHEATS + TWEAKS)}
 INI_DEFAULTS = {'upscaler': 'fsr4', 'preset': '1', 'sharpen': '1', 'sharpness': '0.50',
                 'object_motion': '1', 'show_fps': '1', 'output_res': '1920x1080', 'model_lod': '0',
-                'live_resolution': 'auto',
+                'live_resolution': 'auto', 'dlss_model': 'auto',
                 **{key: '1' if on else '0' for key, _t, on in EFFECTS + EXTRAS + CHEATS + TWEAKS}}
 APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / 'CUSA03173'), 'user_dir': '',
                 'mods_dir': '', 'mods_enabled': True, 'patches_dir': '', 'language': '1',
@@ -175,6 +175,11 @@ UPSCALERS = [('dlss', ('DLSS (NVIDIA GeForce RTX)',)),
              ('fsr3', ('FSR 3.1 (every GPU)', 'FSR 3.1 (любая видеокарта)')),
              ('taa', ('TAA (native resolution anti-aliasing)', 'TAA (нативное сглаживание)')),
              ('off', ('Off', 'Выключен'))]
+# DLSS models (ini dlss_model; the in-game menu has the same list).
+DLSS_MODELS = [('auto', ('Auto (driver default)', 'Авто (выбор драйвера)')),
+               ('k', ('K: transformer (recommended)', 'K: transformer (рекомендуется)')),
+               ('j', ('J: transformer, less ghosting', 'J: transformer, меньше гостинга')),
+               ('l', ('L: newer, heavier', 'L: новее, тяжелее')), ('m', ('M: newer, heavier', 'M: новее, тяжелее'))]
 PRESETS = [('0', ('Native AA (×1.0)',)), ('1', ('Quality (×1.5)',)), ('2', ('Balanced (×1.7)',)),
            ('3', ('Performance (×2)',)), ('4', ('Ultra Performance (×3)',))]
 OUTPUTS = [('1280x720', ('1280 × 720 (Steam Deck)',)), ('1920x1080', ('1920 × 1080',)),
@@ -700,6 +705,9 @@ class Launcher:
                    'a GPU with INT8 dot products; otherwise the game falls back to FSR 3.1 by itself.',
                    'Временной апскейлинг с векторами движения игры. FSR 4 нужны ассеты (ниже) и GPU с INT8; '
                    'иначе игра сама переключится на FSR 3.1.'))
+        self.row(f, _('DLSS model', 'Модель DLSS'), self.choice(f, 'dlss_model', 'ini', DLSS_MODELS),
+                 _('Only for DLSS. Transformer models look best but cost more on RTX 20/30 cards.',
+                   'Только для DLSS. Трансформерные модели лучше выглядят, но тяжелее на RTX 20/30.'))
         self.row(f, _('Quality preset', 'Пресет'), self.choice(f, 'preset', 'ini', PRESETS),
                  _('Render scale per axis: Quality renders at 1/1.5 of the output size.',
                    'Масштаб рендера по каждой оси: Quality рисует в 1/1.5 размера вывода.'))

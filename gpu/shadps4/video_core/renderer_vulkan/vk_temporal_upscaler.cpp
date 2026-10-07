@@ -731,7 +731,11 @@ void TemporalUpscaler::RecordTaa(vk::CommandBuffer cmdbuf, vk::ImageView color,
 void TemporalUpscaler::ExtraSharpen(vk::CommandBuffer cmdbuf, vk::Image target, bool ldr, u32 w,
                                     u32 h) {
     const auto& settings = BbSettings::Get();
-    const float extra = std::clamp(settings.sharpness.load(), 0.0f, 2.0f) - 1.0f;
+    // bbport: FSR 3/4 sharpen up to 1 themselves (RCAS); DLSS no longer sharpens, so for it the
+    // whole slider is this pass.
+    const float builtin = settings.upscaler == BbSettings::UpscalerDlss ? 0.0f : 1.0f;
+    const float extra =
+        std::min(std::clamp(settings.sharpness.load(), 0.0f, 2.0f) - builtin, 1.0f);
     if (!settings.sharpen || extra <= 0.0f) {
         return;
     }
@@ -1990,7 +1994,8 @@ bool TemporalUpscaler::RecordDlss(vk::CommandBuffer cmdbuf, const Dlss::Resource
                                   const Dlss::Resource& depth, u32 w, u32 h, u32 ow, u32 oh,
                                   float frame_ms, bool hdr) {
     Dlss* dlss = Dlss::Get();
-    const Dlss::FeatureDesc desc{w, h, ow, oh, Dlss::QualityForScale(float(ow) / float(w)), hdr};
+    const Dlss::FeatureDesc desc{w, h, ow, oh, Dlss::QualityForScale(float(ow) / float(w)), hdr,
+                                 u32(std::max(0, BbSettings::Get().dlss_model.load()))};
     bool ok = true;
     if (!dlss->HasFeature(desc)) {
         // The previous feature may still be in use by submitted work; `cmdbuf` stays open.
@@ -2002,7 +2007,6 @@ bool TemporalUpscaler::RecordDlss(vk::CommandBuffer cmdbuf, const Dlss::Resource
     if (ok) {
         // The jitter and motion vectors FSR 3 gets: render pixels, current to previous.
         const float sign = BbToggle::Disabled(1u << 26) ? -1.0f : 1.0f;
-        const auto& settings = BbSettings::Get();
         ok = dlss->Evaluate(cmdbuf, {
             .color = color,
             .depth = depth,
@@ -2014,7 +2018,8 @@ bool TemporalUpscaler::RecordDlss(vk::CommandBuffer cmdbuf, const Dlss::Resource
             .jitter_y = sign * jitter[1],
             .reset = reset,
             .frame_ms = frame_ms,
-            .sharpness = settings.sharpen ? std::min(settings.sharpness.load(), 1.0f) : 0.0f,
+            // DLSS 2.5.1 and newer ignore their sharpness; ExtraSharpen runs RCAS instead.
+            .sharpness = 0.0f,
         });
     }
     if (!ok) {

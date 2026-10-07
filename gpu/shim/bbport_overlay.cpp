@@ -48,6 +48,8 @@ namespace BbOverlay {
 namespace {
 
 std::mutex imgui_mutex; // the ImGui context: window thread (input) and present thread
+// bbport: for the VRAM line of the FPS counter (VK_EXT_memory_budget); set by Init.
+const Vulkan::Instance* overlay_instance = nullptr;
 bool initialized = false;
 std::atomic<bool> menu_open{false};
 bool l3_down = false, r3_down = false;
@@ -200,6 +202,28 @@ void Menu() {
     }
     if (const char* problem = s.dlss_problem.load(); problem && upscaler == BbSettings::UpscalerDlss) {
         ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "DLSS: %s", problem);
+    }
+    if (s.upscaler == BbSettings::UpscalerDlss) {
+        // bbport: the DLSS model (render preset); a change recreates the feature (short pause).
+        static const char* models[] = {"Авто (выбор драйвера)", "J (transformer)",
+                                       "K (transformer, рекомендуемая)", "L (новая, тяжелее)",
+                                       "M (новая, тяжелее)"};
+        static_assert(sizeof(models) / sizeof(models[0]) == BbSettings::DlssModelCount);
+        int model_index = 0;
+        for (int m = 0; m < BbSettings::DlssModelCount; ++m) {
+            if (BbSettings::DlssModels[m] == s.dlss_model) model_index = m;
+        }
+        if (ImGui::BeginCombo("Модель DLSS", models[model_index])) {
+            for (int m = 0; m < BbSettings::DlssModelCount; ++m) {
+                if (ImGui::Selectable(models[m], m == model_index)) {
+                    Store(s.dlss_model, BbSettings::DlssModels[m], true);
+                }
+            }
+            ImGui::EndCombo();
+        }
+        Hint("Трансформерные модели (J/K/L/M) заметно тяжелее на RTX 20/30: если не хватает FPS, "
+             "возьмите пресет на ступень ниже. Резкость для DLSS делает отдельный проход RCAS "
+             "(весь ползунок 0..1), у самого DLSS её больше нет.");
     }
     if (const char* problem = s.fsr4_problem.load()) {
         ImGui::PushTextWrapPos();
@@ -441,6 +465,23 @@ void FpsCounter() {
                 : s.upscaler == BbSettings::UpscalerTaa ? "TAA"
                 : s.upscaler == BbSettings::UpscalerDlss ? "DLSS"
                                                          : "");
+    // bbport: video memory in use against the driver's budget for this process, about twice a
+    // second (a driver query). Orange above 90%: textures start to spill into system memory.
+    if (overlay_instance && overlay_instance->CanReportMemoryUsage()) {
+        static u64 used = 0, budget = 0;
+        static u32 frames = 0;
+        if (frames++ % 30 == 0) {
+            used = overlay_instance->GetDeviceMemoryUsage();
+            budget = overlay_instance->GetDeviceMemoryBudgetNow();
+        }
+        if (budget) {
+            const float gib = 1024.0f * 1024.0f * 1024.0f;
+            const bool tight = used > budget / 10 * 9;
+            ImGui::TextColored(tight ? ImVec4(1.0f, 0.6f, 0.25f, 1.0f)
+                                     : ImGui::GetStyleColorVec4(ImGuiCol_Text),
+                               "VRAM %.2f / %.2f ГБ", float(used) / gib, float(budget) / gib);
+        }
+    }
     ImGui::End();
 }
 
@@ -448,6 +489,7 @@ void FpsCounter() {
 
 void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) {
     std::scoped_lock lock{imgui_mutex};
+    overlay_instance = &instance;
     if (initialized) {
         return;
     }

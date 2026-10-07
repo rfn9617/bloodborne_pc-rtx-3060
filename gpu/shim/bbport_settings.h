@@ -16,6 +16,13 @@ inline bool IsFsr4(int upscaler) {
     return upscaler == UpscalerFsr4 || upscaler == UpscalerFsr411;
 }
 enum Preset : int { NativeAA = 0, Quality, Balanced, Performance, UltraPerformance, PresetCount };
+/// DLSS models (NVSDK_NGX_DLSS_Hint_Render_Preset, ini dlss_model): 0 lets the driver choose per
+/// quality mode. J/K: transformer models (DLSS 4), K recommended; L/M: newer transformer models
+/// (the driver's own choice for Ultra Performance / Performance). All are heavier than the old
+/// CNN models on RTX 20/30 cards.
+inline constexpr int DlssModels[] = {0, 10, 11, 12, 13};
+inline constexpr const char* DlssModelNames[] = {"auto", "j", "k", "l", "m"};
+inline constexpr int DlssModelCount = 5;
 enum DebugView : int { DebugNone = 0, DebugReactive = 1, DebugMotion = 2, DebugViewCount };
 
 /// Game effects switched by the community patches at start (patches.py EFFECTS): ini key,
@@ -70,6 +77,8 @@ struct Values {
     // FSR 4 checks (menu): the provider's auto exposure, the jitter sign it is given.
     std::atomic<bool> fsr4_auto_exposure{true};
     std::atomic<bool> fsr4_invert_jitter{false};
+    /// DLSS model: a DlssModels value (0 = driver default). A change recreates the feature.
+    std::atomic<int> dlss_model{0};
     std::atomic<int> active_render_width{1920}, active_render_height{1080};
     /// Applied at start (patches.py); the menu shows when a restart is needed.
     std::atomic<bool> effects[EffectCount]{};
@@ -114,5 +123,7 @@ void Save();
 float PresetScale(int preset);
 const char* PresetName(int preset);
 const char* UpscalerName(int upscaler);
+/// ini name of a DLSS model value ("auto", "k", ...).
+const char* DlssModelName(int model);
 
 } // namespace BbSettings

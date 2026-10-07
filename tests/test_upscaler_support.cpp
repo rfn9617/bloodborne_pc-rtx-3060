@@ -54,6 +54,17 @@ int main() {
             }
         }
     }
+    // The DLSS model is kept in the file by name.
+    for (int m = 0; m < DlssModelCount; ++m) {
+        s.upscaler = UpscalerDlss;
+        s.dlss_model = DlssModels[m];
+        Save();
+        s.dlss_model = -1;
+        s.upscaler = UpscalerOff;
+        Load();
+        assert(s.dlss_model == DlssModels[m] && s.upscaler == UpscalerDlss);
+    }
+    s.dlss_model = 0;
     s.startup_preset = Quality;
     s.startup_upscaler = UpscalerFsr3;
     s.upscaler = UpscalerFsr3;
