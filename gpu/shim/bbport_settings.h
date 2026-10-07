@@ -20,9 +20,11 @@ enum Preset : int { NativeAA = 0, Quality, Balanced, Performance, UltraPerforman
 /// quality mode. J/K: transformer models (DLSS 4), K recommended; L/M: newer transformer models
 /// (the driver's own choice for Ultra Performance / Performance). All are heavier than the old
 /// CNN models on RTX 20/30 cards.
-inline constexpr int DlssModels[] = {0, 10, 11, 12, 13};
-inline constexpr const char* DlssModelNames[] = {"auto", "j", "k", "l", "m"};
-inline constexpr int DlssModelCount = 5;
+/// E (5): the last CNN model, much cheaper on RTX 20/30; NVIDIA marks it deprecated, and a DLSS
+/// runtime without it falls back to its default.
+inline constexpr int DlssModels[] = {0, 5, 10, 11, 12, 13};
+inline constexpr const char* DlssModelNames[] = {"auto", "e", "j", "k", "l", "m"};
+inline constexpr int DlssModelCount = 6;
 enum DebugView : int { DebugNone = 0, DebugReactive = 1, DebugMotion = 2, DebugViewCount };
 
 /// Game effects switched by the community patches at start (patches.py EFFECTS): ini key,

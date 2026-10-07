@@ -3,11 +3,14 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <ranges>
 #include <string>
+#include <thread>
+#include <tuple>
 #include <unordered_set>
 
 #include "common/hash.h"
@@ -345,15 +348,77 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
     };
-    WarmUp();
-
-    auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
+    // bbport: the driver's pipeline cache is created before the warm-up (it used to be created
+    // after it, empty, and was never saved): the warm-up and every later pipeline reuse the
+    // compiled GPU code of earlier sessions instead of running the driver's compiler again.
+    // The driver checks the data's header (vendor, device, driver build) and ignores a cache
+    // from another GPU or driver.
+    std::vector<u8> initial;
+    if (EmulatorSettings.IsPipelineCacheEnabled()) {
+        const Common::FS::IOFile file{DriverCachePath(), Common::FS::FileAccessMode::Read};
+        if (file.IsOpen()) {
+            initial.resize(file.GetSize());
+            if (file.Read(initial) != initial.size()) initial.clear();
+        }
+    }
+    auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique(
+        {.initialDataSize = initial.size(), .pInitialData = initial.data()});
+    if (cache_result != vk::Result::eSuccess && !initial.empty()) {
+        LOG_WARNING(Render_Vulkan, "Driver pipeline cache rejected ({}), starting empty",
+                    vk::to_string(cache_result));
+        auto retry = instance.GetDevice().createPipelineCacheUnique({});
+        cache_result = retry.result;
+        cache = std::move(retry.value);
+    }
     ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
                vk::to_string(cache_result));
     pipeline_cache = std::move(cache);
+    std::printf("Pipeline cache: driver cache %.1f MB loaded\n", initial.size() / 1e6);
+    WarmUp();
+    SaveDriverCache();
 }
 
-PipelineCache::~PipelineCache() = default;
+PipelineCache::~PipelineCache() {
+    SaveDriverCache(true);
+}
+
+std::filesystem::path PipelineCache::DriverCachePath() {
+    return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / "vulkan_driver_pipelines.bin";
+}
+
+void PipelineCache::SaveDriverCache(bool wait) {
+    if (!pipeline_cache || !EmulatorSettings.IsPipelineCacheEnabled()) {
+        return;
+    }
+    static std::atomic<bool> writing{false};
+    if (writing.exchange(true)) {
+        return; // the previous write is still running; the next save takes the newer data
+    }
+    driver_cache_saved_at = num_new_pipelines;
+    auto [result, data] = instance.GetDevice().getPipelineCacheData(*pipeline_cache);
+    if (result != vk::Result::eSuccess || data.empty()) {
+        writing = false;
+        return;
+    }
+    auto write = [data = std::move(data), path = DriverCachePath()] {
+        // Beside and renamed into place: a game that ends mid-write keeps the previous cache.
+        auto temp = path;
+        temp += ".tmp";
+        bool ok = false;
+        {
+            const Common::FS::IOFile file{temp, Common::FS::FileAccessMode::Create};
+            ok = file.IsOpen() && file.Write(data) == data.size();
+        }
+        std::error_code error;
+        if (ok) std::filesystem::rename(temp, path, error);
+        writing = false;
+    };
+    if (wait) {
+        write();
+    } else {
+        std::thread(std::move(write)).detach();
+    }
+}
 
 // bbport: shader/pipeline compile time on the GPU thread, reported by BB_FRAME_STATS.
 std::atomic<u64> g_bb_compile_ns;
@@ -436,7 +501,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             sel.runtime_infos, sel.fetch_shader, sel.modules, sdata, false);
 
         RegisterPipelineData(sel.graphics_key, pipeline_hash, sdata);
-        ++num_new_pipelines;
+        if (++num_new_pipelines - driver_cache_saved_at >= 32) SaveDriverCache();
 
         if (EmulatorSettings.IsShaderCollect()) {
             for (auto stage = 0; stage < MaxShaderStages; ++stage) {
@@ -466,7 +531,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
                                                        *pipeline_cache, compute_key, *sel.infos[0],
                                                        sel.modules[0], sdata, false);
         RegisterPipelineData(compute_key, sdata);
-        ++num_new_pipelines;
+        if (++num_new_pipelines - driver_cache_saved_at >= 32) SaveDriverCache();
 
         if (EmulatorSettings.IsShaderCollect()) {
             auto& m = sel.modules[0];

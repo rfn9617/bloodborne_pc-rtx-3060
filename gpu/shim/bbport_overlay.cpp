@@ -205,7 +205,8 @@ void Menu() {
     }
     if (s.upscaler == BbSettings::UpscalerDlss) {
         // bbport: the DLSS model (render preset); a change recreates the feature (short pause).
-        static const char* models[] = {"Авто (выбор драйвера)", "J (transformer)",
+        static const char* models[] = {"Авто (выбор драйвера)", "E (CNN, лёгкая для RTX 20/30)",
+                                       "J (transformer)",
                                        "K (transformer, рекомендуемая)", "L (новая, тяжелее)",
                                        "M (новая, тяжелее)"};
         static_assert(sizeof(models) / sizeof(models[0]) == BbSettings::DlssModelCount);

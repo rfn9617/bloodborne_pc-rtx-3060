@@ -177,6 +177,7 @@ UPSCALERS = [('dlss', ('DLSS (NVIDIA GeForce RTX)',)),
              ('off', ('Off', 'Выключен'))]
 # DLSS models (ini dlss_model; the in-game menu has the same list).
 DLSS_MODELS = [('auto', ('Auto (driver default)', 'Авто (выбор драйвера)')),
+               ('e', ('E: CNN, light on RTX 20/30', 'E: CNN, лёгкая для RTX 20/30')),
                ('k', ('K: transformer (recommended)', 'K: transformer (рекомендуется)')),
                ('j', ('J: transformer, less ghosting', 'J: transformer, меньше гостинга')),
                ('l', ('L: newer, heavier', 'L: новее, тяжелее')), ('m', ('M: newer, heavier', 'M: новее, тяжелее'))]

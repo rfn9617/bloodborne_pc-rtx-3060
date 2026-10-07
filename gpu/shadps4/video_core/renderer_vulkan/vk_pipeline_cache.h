@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <filesystem>
 #include <unordered_map>
 #include <shared_mutex>
 #include <variant>
@@ -179,6 +180,12 @@ private:
         return num_new_pipelines > 0;
     }
 
+    /// bbport: writes the Vulkan driver's pipeline cache (compiled GPU code) beside the shader
+    /// cache, in the background; loaded at the next start so known pipelines skip the driver's
+    /// compiler. Called after the warm-up, every few new pipelines and at shutdown.
+    void SaveDriverCache(bool wait = false);
+    static std::filesystem::path DriverCachePath();
+
 private:
     const Instance& instance;
     Scheduler& scheduler;
@@ -198,6 +205,7 @@ private:
     PipelineSelection sel{}; ///< GPU thread selection state
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
+    u32 driver_cache_saved_at{}; ///< bbport: num_new_pipelines at the last SaveDriverCache
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,
