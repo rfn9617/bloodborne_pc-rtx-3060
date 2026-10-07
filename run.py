@@ -18,6 +18,48 @@ import sys
 PORT = Path(__file__).resolve().parent
 
 
+class SafeStream:
+    """bbport: output that outlives the launcher. The launcher reads this output through a pipe;
+    once its window closes (or "close the launcher when the game starts"), a write fails with
+    OSError [Errno 22] and would end the game's preparation. Later output is dropped instead."""
+
+    def __init__(self, stream):
+        self.stream = stream
+
+    def write(self, text):
+        if self.stream is not None:
+            try:
+                return self.stream.write(text)
+            except (OSError, ValueError):
+                self.stream = None
+        return len(text)
+
+    def flush(self):
+        if self.stream is not None:
+            try:
+                self.stream.flush()
+            except (OSError, ValueError):
+                self.stream = None
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
+sys.stdout = SafeStream(sys.stdout)
+sys.stderr = SafeStream(sys.stderr)
+
+
+def relay(command, **kwargs):
+    """Runs a preparation script with its output passed on line by line through this process's
+    SafeStream, so a closed launcher cannot break the script itself (it would fail the same way)."""
+    process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, **kwargs)
+    for raw in iter(process.stdout.readline, b''):
+        sys.stdout.write(raw.decode('utf-8', errors='replace'))
+        sys.stdout.flush()
+    return process.wait()
+
+
 def fail(message):
     print(message, file=sys.stderr)
     sys.exit(1)
@@ -49,9 +91,9 @@ def run_script(name, *args, capture=False):
         return result.stdout
     # stdin given: the output handles are passed explicitly (a windowed Bloodborne.exe child would
     # get none otherwise).
-    result = subprocess.run(command, stdin=subprocess.DEVNULL, creationflags=no_console())
-    if result.returncode:
-        sys.exit(result.returncode)
+    returncode = relay(command, creationflags=no_console())
+    if returncode:
+        sys.exit(returncode)
     return None
 
 
