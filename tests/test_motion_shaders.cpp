@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Exercise the actual SPIR-V backend without opening a window or loading the game.
 // Output is validated by spirv-val (see docs/upscaler.md).
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <setjmp.h>
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/ir/ir_emitter.h"
+#include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 
 
 int main(int argc, char** argv) {
@@ -57,6 +59,24 @@ int main(int argc, char** argv) {
             std::ofstream out(path, std::ios::binary);
             out.write(reinterpret_cast<const char*>(code.data()), code.size() * sizeof(u32));
             if (!out) { return 1; }
+            if (vertex && motion) {
+                // bbport: a cached motion vertex shader is re-addressed for a new session: the
+                // three embedded bases (params, params + 16, positions) are replaced, and an
+                // identical compile with the new addresses gives the same module.
+                auto patched = code;
+                MotionVectors::params_address = 0x7f0000100000;
+                MotionVectors::positions_address = 0x7f0000200000;
+                const u32 replaced = Vulkan::PatchMotionAddresses(patched, 0x10000, 0x20000);
+                const auto again = Backend::SPIRV::EmitSPIRV(profile, runtime, program, bindings);
+                MotionVectors::params_address = 0x10000;
+                MotionVectors::positions_address = 0x20000;
+                std::printf("motion vertex shader: %u addresses replaced, %s a fresh compile\n",
+                            replaced, patched == again ? "identical to" : "DIFFERENT from");
+                std::ofstream(dir / "vertex-motion-patched.spv", std::ios::binary)
+                    .write(reinterpret_cast<const char*>(patched.data()),
+                           patched.size() * sizeof(u32));
+                if (replaced != 3 || patched != again) { return 2; }
+            }
         }
     }
 }

@@ -374,8 +374,8 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                vk::to_string(cache_result));
     pipeline_cache = std::move(cache);
     std::printf("Pipeline cache: driver cache %.1f MB loaded\n", initial.size() / 1e6);
-    WarmUp();
-    SaveDriverCache();
+    // bbport: WarmUp() is called by the rasterizer once the object motion buffers exist (their
+    // addresses are patched into cached motion vertex shaders).
 }
 
 PipelineCache::~PipelineCache() {
@@ -879,6 +879,12 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     }
 
     RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
+    // bbport: a motion vertex shader embeds this session's motion buffer addresses; they are
+    // kept beside it so a later session can load it with its own addresses patched in.
+    if (info.hw_stage == Shader::HwStage::Vertex && info.sw_stage == Shader::SwStage::Vertex &&
+        runtime_info.hw.vs.motion_vectors && Shader::MotionVectors::positions_address != 0) {
+        RegisterMotionAddresses(info.pgm_hash, perm_idx);
+    }
 
     const auto name = GetShaderName(info.hw_stage, info.pgm_hash, perm_idx);
     Vulkan::SetObjectName(instance.GetDevice(), module, name);

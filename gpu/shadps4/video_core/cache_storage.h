@@ -18,6 +18,8 @@ enum class BlobType : u32 {
     ShaderBinary,
     PipelineKey,
     ShaderProfile,
+    /// bbport: the object motion buffer addresses a motion vertex shader embeds (two u64).
+    MotionAddresses,
 };
 
 class DataBase {

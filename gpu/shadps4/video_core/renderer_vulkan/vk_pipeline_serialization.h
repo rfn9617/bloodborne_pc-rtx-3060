@@ -17,5 +17,10 @@ void RegisterShaderMeta(const Shader::Info& info,
                         const std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
                         const Shader::StageSpecialization& spec, size_t perm_hash, size_t perm_idx);
 void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx);
+/// bbport: records this session's object motion buffer addresses for a motion vertex shader.
+void RegisterMotionAddresses(u64 pgm_hash, size_t perm_idx);
+/// bbport: replaces the motion buffer addresses `spv` was compiled with (old_params,
+/// old_positions) by this session's. Returns how many constants were replaced.
+u32 PatchMotionAddresses(std::vector<u32>& spv, u64 old_params, u64 old_positions);
 
 } // namespace Vulkan

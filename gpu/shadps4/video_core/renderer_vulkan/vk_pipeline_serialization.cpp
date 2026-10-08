@@ -6,6 +6,9 @@
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
 #include "video_core/cache_storage.h"
+#include <cstring>
+#include <cstdio>
+#include <array>
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -91,6 +94,52 @@ void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx)
                                        std::move(spv));
 }
 
+void RegisterMotionAddresses(u64 pgm_hash, size_t perm_idx) {
+    if (!Storage::DataBase::Instance().IsOpened()) {
+        return;
+    }
+    const u64 params = Shader::MotionVectors::params_address;
+    const u64 positions = Shader::MotionVectors::positions_address;
+    std::vector<u8> data(16);
+    std::memcpy(data.data(), &params, 8);
+    std::memcpy(data.data() + 8, &positions, 8);
+    Storage::DataBase::Instance().Save(Storage::BlobType::MotionAddresses,
+                                       fmt::format("{:#018x}_{}", pgm_hash, perm_idx),
+                                       std::move(data));
+}
+
+u32 PatchMotionAddresses(std::vector<u32>& spv, u64 old_params, u64 old_positions) {
+    // EmitVertexMotion addresses the buffers as base + index * stride with 64-bit OpConstant
+    // bases: params, params + 16 and positions. Each is replaced by the same base of this
+    // session; a 64-bit constant with exactly one of these values is nothing else in practice.
+    const u64 new_params = Shader::MotionVectors::params_address;
+    const u64 new_positions = Shader::MotionVectors::positions_address;
+    const std::array<std::pair<u64, u64>, 3> map{{{old_params, new_params},
+                                                  {old_params + 16, new_params + 16},
+                                                  {old_positions, new_positions}}};
+    constexpr u32 OpConstant = 43;
+    u32 replaced = 0;
+    for (size_t i = 5; i < spv.size();) { // after the 5-word header
+        const u32 words = spv[i] >> 16;
+        if (words == 0 || i + words > spv.size()) {
+            break; // malformed: leave the rest alone
+        }
+        if ((spv[i] & 0xffff) == OpConstant && words == 5) {
+            const u64 value = u64(spv[i + 3]) | (u64(spv[i + 4]) << 32);
+            for (const auto& [from, to] : map) {
+                if (value == from) {
+                    spv[i + 3] = u32(to);
+                    spv[i + 4] = u32(to >> 32);
+                    ++replaced;
+                    break;
+                }
+            }
+        }
+        i += words;
+    }
+    return replaced;
+}
+
 bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
                     std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
                     Shader::StageSpecialization& spec, size_t& perm_idx) {
@@ -115,11 +164,8 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
     spec.Deserialize(ar);
     info.Deserialize(ar);
 
-    // Motion vertex shaders embed session-local buffer device addresses. They must be
-    // recompiled for the current allocation, never loaded from a previous process.
-    if (info.hw_stage == Shader::HwStage::Vertex && spec.runtime_info.hw.vs.motion_vectors) {
-        return false;
-    }
+    // Motion vertex shaders embed session-local buffer device addresses: LoadPipelineStage
+    // patches in this session's (bbport), or the shader is compiled again at first use.
 
     fetch_shader_data = spec.fetch_shader_data;
     return true;
@@ -264,11 +310,28 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
     }
 
     std::vector<u32> spv{};
-    Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary,
-                                       fmt::format("{:#018x}_{}", program->info.pgm_hash, perm_idx),
-                                       spv);
+    const auto blob_name = fmt::format("{:#018x}_{}", program->info.pgm_hash, perm_idx);
+    Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary, blob_name, spv);
     if (spv.empty()) {
         return false;
+    }
+    // bbport: a motion vertex shader gets this session's motion buffer addresses. Without the
+    // recorded addresses (older caches) or the motion buffers it is compiled at first use.
+    if (program->info.hw_stage == Shader::HwStage::Vertex &&
+        spec.runtime_info.hw.vs.motion_vectors) {
+        std::vector<u8> addresses;
+        Storage::DataBase::Instance().Load(Storage::BlobType::MotionAddresses, blob_name,
+                                           addresses);
+        if (addresses.size() != 16 || Shader::MotionVectors::positions_address == 0) {
+            return false;
+        }
+        u64 old_params{}, old_positions{};
+        std::memcpy(&old_params, addresses.data(), 8);
+        std::memcpy(&old_positions, addresses.data() + 8, 8);
+        if (PatchMotionAddresses(spv, old_params, old_positions) == 0) {
+            return false;
+        }
+        ++num_motion_patched;
     }
 
     // Permutation hash depends on shader variation index. To prevent collisions, we need insert it
@@ -380,6 +443,8 @@ void PipelineCache::WarmUp() {
         });
 
     LOG_INFO(Render, "Preloaded {} pipelines", num_pipelines);
+    std::printf("Pipeline cache: %u of %u pipelines preloaded (%u motion shaders re-addressed)\n",
+                num_pipelines, num_total_pipelines, num_motion_patched);
     if (num_total_pipelines > num_pipelines) {
         LOG_WARNING(Render, "{} stale pipelines were found. Consider re-generating the cache",
                     num_total_pipelines - num_pipelines);
