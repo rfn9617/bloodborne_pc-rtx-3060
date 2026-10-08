@@ -1013,58 +1013,78 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
 }
 
 void TextureCache::GarbageCollectImages() {
+    // bbport: ages in seconds. gc_tick advances once per guest submission (hundreds a second),
+    // so the tick at the start of each of the last 64 seconds is kept.
+    const u64 second = u64(std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count());
+    const bool new_second = second != gc_second;
+    if (new_second) {
+        gc_second = second;
+        gc_tick_at_second[second % gc_tick_at_second.size()] = gc_tick;
+    }
     if (instance.CanReportMemoryUsage()) {
         total_used_memory = instance.GetDeviceMemoryUsage();
-        // bbport: on integrated GPUs (Steam Deck) the usage covers system-memory heaps holding
-        // much more than images (buffers backing guest memory), and the startup budget left
-        // ~1 GB after its 8 GB system reserve: usage stayed above the critical mark, so the
-        // collector evicted images used two or three frames ago on every submission and wrote
-        // GPU-written ones back. Compare with the driver's current budget instead.
-        // BB_GC_BUDGET_MB=N: this rule with a fixed budget on any GPU (tests on a desktop).
+        // bbport: the marks follow the driver's current budget for this process on every GPU
+        // (refreshed once a second). The startup formula, made for 8 GB and more, put the
+        // pressure mark at ~1.8 GB on a 6 GB card: usage was always "under pressure", where
+        // images unused for ~80 submissions (a fraction of a second) were to be evicted.
+        // BB_GC_BUDGET_MB=N: a fixed budget (tests).
         static const u64 forced_budget = [] {
             const char* env = std::getenv("BB_GC_BUDGET_MB");
             return env ? std::strtoull(env, nullptr, 10) << 20 : 0;
         }();
-        if (instance.IsIntegrated() || forced_budget) {
-            const u64 budget = forced_budget ? forced_budget : instance.GetDeviceMemoryBudgetNow();
-            if (budget != 0) {
-                trigger_gc_memory = budget / 10 * 7;
-                pressure_gc_memory = budget / 100 * 85;
-                critical_gc_memory = budget / 100 * 95;
+        if (new_second || gc_budget == 0) {
+            gc_budget = forced_budget ? forced_budget : instance.GetDeviceMemoryBudgetNow();
+            if (gc_budget != 0) {
+                trigger_gc_memory = gc_budget / 100 * 60;
+                pressure_gc_memory = gc_budget / 100 * 85;
+                critical_gc_memory = gc_budget / 100 * 93;
             }
         }
     }
     if (total_used_memory < trigger_gc_memory) {
         return;
     }
+    // Unused for this long: 20 s normally (BB_GC_IDLE_SECONDS; the textures of an area left
+    // behind), 5 s near the budget, 1 s over the critical mark.
+    static const u64 idle_seconds = [] {
+        const char* env = std::getenv("BB_GC_IDLE_SECONDS");
+        return std::clamp<u64>(env ? std::strtoull(env, nullptr, 10) : 20, 1, 60);
+    }();
+    const auto tick_seconds_ago = [&](u64 seconds) {
+        return gc_tick_at_second[(second - seconds) % gc_tick_at_second.size()];
+    };
     std::scoped_lock lock{mutex};
     bool pressured = false;
     bool aggresive = false;
-    u64 ticks_to_destroy = 0;
+    u64 below_tick = 0;
     size_t num_deletions = 0;
+    u32 visited = 0;
 
     const auto configure = [&](bool allow_aggressive) {
         pressured = total_used_memory >= pressure_gc_memory;
         aggresive = allow_aggressive && total_used_memory >= critical_gc_memory;
-        ticks_to_destroy = aggresive ? 160 : pressured ? 80 : 16;
-        ticks_to_destroy = std::min(ticks_to_destroy, gc_tick);
+        below_tick = tick_seconds_ago(aggresive ? 1 : pressured ? 5 : idle_seconds);
         num_deletions = aggresive ? 40 : pressured ? 20 : 10;
+        visited = 0;
     };
     const auto clean_up = [&](ImageId image_id) {
-        if (num_deletions == 0) {
+        if (num_deletions == 0 || ++visited > 256) {
             return true;
         }
-        --num_deletions;
         auto& image = slot_images[image_id];
         const bool download = image.SafeToDownload();
         const bool tiled = image.info.IsTiled();
-        if (tiled && download) {
-            // This is a workaround for now. We can't handle non-linear image downloads.
+        // bbport (from the base port's 0.3): images that cannot go now (GPU-written: their
+        // contents exist only here; tiled ones cannot be written back at all) neither use up
+        // the deletions nor stay first in line. The oldest ten being such render targets
+        // stopped the collector for good ("0 images evicted") and VRAM grew with every area.
+        if ((tiled && download) || (download && !pressured)) {
+            lru_cache.Touch(image.lru_id, gc_tick);
             return false;
         }
-        if (download && !pressured) {
-            return false;
-        }
+        --num_deletions;
         if (download) {
             // bbport: synchronously, while the image still protects its pages. A deferred
             // write-back landed after FreeImage had unprotected them, over whatever the game
@@ -1090,20 +1110,23 @@ void TextureCache::GarbageCollectImages() {
 
     // Try to remove anything old enough and not high priority.
     configure(false);
-    lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
+    lru_cache.ForEachItemBelow(below_tick, clean_up);
 
     if (total_used_memory >= critical_gc_memory) {
         // If we are still over the critical limit, run an aggressive GC
         configure(true);
-        lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
+        lru_cache.ForEachItemBelow(below_tick, clean_up);
     }
     // bbport: evictions under memory pressure, at most every 5 s (BB_FRAME_STATS or not).
-    if (pressured || gc_downloads != 0) {
+    if (pressured || gc_downloads != 0 || gc_evictions != 0) {
         const auto now = std::chrono::steady_clock::now();
         if (now - gc_report_time >= std::chrono::seconds(5)) {
-            std::printf("Texture cache: memory pressure, %llu of %llu MiB (critical %llu): "
-                        "%llu images evicted, %llu written back since the last report\n",
+            std::printf("Texture cache: VRAM %llu of %llu MiB budget (collect from %llu, pressure "
+                        "%llu, critical %llu): %llu images evicted, %llu written back since the "
+                        "last report\n",
                         (unsigned long long)(total_used_memory >> 20),
+                        (unsigned long long)(gc_budget >> 20),
+                        (unsigned long long)(trigger_gc_memory >> 20),
                         (unsigned long long)(pressure_gc_memory >> 20),
                         (unsigned long long)(critical_gc_memory >> 20),
                         (unsigned long long)gc_evictions, (unsigned long long)gc_downloads);
