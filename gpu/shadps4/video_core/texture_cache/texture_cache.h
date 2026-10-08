@@ -17,6 +17,7 @@
 #include <tsl/robin_map.h>
 
 #include "common/lru_cache.h"
+#include "video_core/texture_cache/gc_age.h"
 #include "common/slot_vector.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/multi_level_page_table.h"
@@ -403,7 +404,7 @@ private:
     u64 gc_evictions = 0, gc_downloads = 0; ///< bbport: pressure report
     std::chrono::steady_clock::time_point gc_report_time{};
     /// bbport: gc_tick at the start of each of the last 64 seconds; the budget the marks use.
-    std::array<u64, 64> gc_tick_at_second{};
+    GcAge gc_age;
     u64 gc_second = 0;
     u64 gc_budget = 0;
     u64 trigger_gc_memory = 0;

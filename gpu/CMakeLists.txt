@@ -214,7 +214,18 @@ if (WIN32)
 endif()
 
 # Explicit test targets; neither launches the game nor needs a Vulkan device.
+foreach(BB_CPU_TEST IN ITEMS texture_detail gc_age staging_policy)
+    string(REPLACE "_" "-" BB_CPU_TARGET "${BB_CPU_TEST}")
+    add_executable(${BB_CPU_TARGET}-test EXCLUDE_FROM_ALL ../tests/test_${BB_CPU_TEST}.cpp)
+    target_compile_options(${BB_CPU_TARGET}-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+    target_include_directories(${BB_CPU_TARGET}-test PRIVATE .. shadps4)
+endforeach()
 add_executable(motion-history-test EXCLUDE_FROM_ALL ../tests/test_motion_history.cpp)
+add_executable(shader-metadata-test EXCLUDE_FROM_ALL ../tests/test_shader_metadata.cpp
+    ../tests/test_gpu_runtime_stubs.cpp)
+target_compile_options(shader-metadata-test PRIVATE -UNDEBUG)
+target_include_directories(shader-metadata-test PRIVATE shim shadps4 third_party/gcn/include)
+target_link_libraries(shader-metadata-test PRIVATE bbgpu)
 target_compile_options(motion-history-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(motion-history-test PRIVATE ..)
 add_executable(motion-shader-test EXCLUDE_FROM_ALL ../tests/test_motion_shaders.cpp ../tests/test_gpu_runtime_stubs.cpp)

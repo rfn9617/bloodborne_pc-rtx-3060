@@ -75,6 +75,8 @@ struct InfoPersistent {
     bool has_fetch_shader{};
     bool has_bitwise_xor{};
     bool uses_dma{};
+    // Used by texture-detail policy after shader cache preload, as well as compilation.
+    bool has_discard{};
 
     InfoPersistent() = default;
     InfoPersistent(HwStage hw_stage_, SwStage sw_stage_, u64 pgm_hash_)
@@ -130,7 +132,6 @@ struct Info : InfoPersistent {
 
     VAddr pgm_base;
     bool has_storage_images{};
-    bool has_discard{};
     bool has_image_gather{};
     bool has_image_query{};
     bool has_readconst{};

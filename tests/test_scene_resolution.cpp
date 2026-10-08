@@ -196,6 +196,20 @@ int main() {
         assert(result == 0xff00ff00);
     }
     std::puts("Scene targets: half-resolution mip level proxy roundtrip PASS");
+    // Removing an original image must retire every mip proxy, while live images stay cached.
+    const auto removed_uid = half.image_uid;
+    const auto before = targets.ProxyCount();
+    const auto generation = targets.Generation();
+    scheduler.Finish();
+    images.erase(half_id);
+    targets.CollectDeleted();
+    assert(!targets.Tracks(removed_uid) && targets.ProxyCount() < before);
+    assert(targets.Generation() == generation + 1);
+    const auto remaining = targets.ProxyCount();
+    targets.CollectDeleted();
+    assert(targets.ProxyCount() == remaining && targets.Generation() == generation + 1);
+    scheduler.Finish(); // retired views/images can now actually be freed
+    std::puts("Scene targets: deleted source proxies retired without repeated invalidation PASS");
     scheduler.Finish();
     vmaDestroyBuffer(instance.GetAllocator(),readback,allocation);
 }

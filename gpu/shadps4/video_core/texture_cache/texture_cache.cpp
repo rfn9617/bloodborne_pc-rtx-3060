@@ -1021,7 +1021,7 @@ void TextureCache::GarbageCollectImages() {
     const bool new_second = second != gc_second;
     if (new_second) {
         gc_second = second;
-        gc_tick_at_second[second % gc_tick_at_second.size()] = gc_tick;
+        gc_age.Record(second, gc_tick);
     }
     if (instance.CanReportMemoryUsage()) {
         total_used_memory = instance.GetDeviceMemoryUsage();
@@ -1053,7 +1053,7 @@ void TextureCache::GarbageCollectImages() {
         return std::clamp<u64>(env ? std::strtoull(env, nullptr, 10) : 20, 1, 60);
     }();
     const auto tick_seconds_ago = [&](u64 seconds) {
-        return gc_tick_at_second[(second - seconds) % gc_tick_at_second.size()];
+        return gc_age.Before(second, seconds);
     };
     std::scoped_lock lock{mutex};
     bool pressured = false;

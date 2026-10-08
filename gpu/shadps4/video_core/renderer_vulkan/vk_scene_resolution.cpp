@@ -17,7 +17,10 @@ namespace Vulkan {
 SceneTargets::SceneTargets(const Instance& i, Scheduler& s, Runtime& r,
                            VideoCore::TextureCache& t)
     : SceneTargets(i, s, r, [&t](VideoCore::ImageId id, u64 uid) {
-        return t.TryGetImage(id, uid);
+        auto* image = t.TryGetImage(id, uid);
+        // Deleted images remain allocated until their deferred GPU destruction completes.
+        return image && (!uid || True(image->flags & VideoCore::ImageFlagBits::Registered))
+                   ? image : nullptr;
     }) {}
 SceneTargets::SceneTargets(const Instance& i, Scheduler& s, Runtime& r, Lookup get)
     : instance{i}, scheduler{s}, runtime{r}, lookup{std::move(get)} {
@@ -117,6 +120,26 @@ void SceneTargets::ResolveAll() {
         if (entry->state.dirty) {
             if (auto* image = lookup(entry->source, entry->uid)) Copy(*entry, *image, true);
         }
+    }
+}
+void SceneTargets::CollectDeleted() {
+    bool removed = false;
+    for (auto it = entries.begin(); it != entries.end();) {
+        if (lookup(it->second->source, it->second->uid)) {
+            ++it;
+            continue;
+        }
+        if (!removed) {
+            scheduler.EndRendering();
+            recent = {};
+            ++generation;
+            removed = true;
+        }
+        tracked.erase(it->second->uid);
+        // Draws already recorded may still reference these views/images. Release them only
+        // when the GPU has finished that submission; do not flush the whole device.
+        scheduler.DeferOperation([retired = std::move(it->second)]() mutable { retired.reset(); });
+        it = entries.erase(it);
     }
 }
 void SceneTargets::NativeAccess(VideoCore::Image& image, vk::AccessFlags2 access) {

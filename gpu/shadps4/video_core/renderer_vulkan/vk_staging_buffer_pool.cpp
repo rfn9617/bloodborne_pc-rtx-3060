@@ -14,6 +14,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
+#include "video_core/renderer_vulkan/staging_policy.h"
 
 namespace Vulkan {
 
@@ -27,7 +28,6 @@ namespace {
 // upload ring keeps BB_STAGING_KEEP_MB (512) and is populated at startup.
 constexpr u64 RING_IDLE_FRAMES = 3000;
 constexpr u64 LARGE_IDLE_FRAMES = 3000;
-constexpr u64 PREWARM_BLOCKS = 8;
 constexpr u64 LARGE_MIN_GRANULARITY = 64_KB;
 constexpr u64 BLOCK_SIZE = 16_MB;
 
@@ -41,9 +41,12 @@ u64 RoundAllocationSize(u64 size) {
 StagingBufferPool::StagingBufferPool(const Instance& instance_, Scheduler& scheduler_)
     : instance{instance_}, scheduler{scheduler_} {
     const char* env = std::getenv("BB_STAGING_KEEP_MB");
-    keep_blocks = (env ? std::strtoull(env, nullptr, 10) : 512) * 1_MB / BLOCK_SIZE;
+    keep_blocks = StagingPolicy::KeepBlocks(env ? std::strtoull(env, nullptr, 10) : 512);
+    const char* prewarm_env = std::getenv("BB_STAGING_PREWARM_MB");
+    const u64 prewarm = StagingPolicy::PrewarmBlocks(
+        keep_blocks, prewarm_env ? std::strtoull(prewarm_env, nullptr, 10) : 128);
     Ring& ring = rings[u32(MemoryType::HostUncached)];
-    for (u64 i = 0; i < PREWARM_BLOCKS; ++i) {
+    for (u64 i = 0; i < prewarm; ++i) {
         auto& block = ring.blocks.emplace_back(Block{
             .buffer = std::make_unique<VideoCore::StreamBuffer>(
                 instance, scheduler, MemoryType::HostUncached, BLOCK_SIZE),
@@ -161,8 +164,9 @@ void StagingBufferPool::FreeDeferred(const StagingBufferRef& ref) {
 
 void StagingBufferPool::TickFrame() {
     ++frame;
-    for (Ring& ring : rings) {
-        TrimRing(ring);
+    for (size_t i = 0; i < rings.size(); ++i) {
+        TrimRing(rings[i], StagingPolicy::RetainedBlocks(
+                              i == u32(MemoryType::HostUncached), keep_blocks));
     }
     for (auto& cache : large_caches) {
         TrimLarge(cache);
@@ -170,11 +174,11 @@ void StagingBufferPool::TickFrame() {
     PublishStats();
 }
 
-void StagingBufferPool::TrimRing(Ring& ring) {
+void StagingBufferPool::TrimRing(Ring& ring, u64 retained_blocks) {
     auto& blocks = ring.blocks;
     for (size_t i = blocks.size(); i-- > 0;) {
         const Block& block = blocks[i];
-        if (blocks.size() <= keep_blocks || frame - block.last_used_frame < RING_IDLE_FRAMES ||
+        if (blocks.size() <= retained_blocks || frame - block.last_used_frame < RING_IDLE_FRAMES ||
             !scheduler.IsFree(block.buffer->LastTick())) {
             continue;
         }

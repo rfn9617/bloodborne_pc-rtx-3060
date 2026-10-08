@@ -490,6 +490,9 @@ private:
     u32 pending_checks = 0;
     u64 proxy_samples = 0; ///< texture bindings that read a scene proxy (statistics)
     float sampler_lod_bias = 0.0f; ///< bbport: extra bias of this draw's samplers
+    float alpha_lod_bias = 0.0f; ///< fragment material samplers only
+    int reported_alpha_detail = -1;
+    u64 scene_collection_generation = 0;
     bool scene_debug_frame = false; ///< BB_SCENE_DEBUG: this frame's passes are printed
     bool PendingWriteOverlaps(VAddr address, u64 size);
     /// Stage B: the ring bindings of the stages of the packet being recorded.

@@ -3,6 +3,7 @@
 
 #include <xxhash.h>
 #include "video_core/renderer_vulkan/ui_composition.h"
+#include "video_core/renderer_vulkan/texture_detail.h"
 #include "bbport_toggles.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
 #include "common/debug.h"
@@ -1413,6 +1414,11 @@ void Rasterizer::OnSubmit() {
     }
     texture_cache.ProcessDownloadImages();
     texture_cache.RunGarbageCollector();
+    const auto generation = texture_cache.RegistryGeneration();
+    if (generation != scene_collection_generation) {
+        scene_targets->CollectDeleted();
+        scene_collection_generation = generation;
+    }
     runtime.TickFrame();
 }
 
@@ -1555,15 +1561,20 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
             std::printf("Upscaler: scene texture LOD bias %.2f\n", sampler_lod_bias);
         }
     }
-    // bbport: alpha-tested surfaces (the pixel shader discards): iron grates, fences, foliage.
-    // Their thin parts live in the alpha channel; smaller mips average it below the cutoff, so
-    // at a distance bars break up and vanish, then pop back in up close. Sharper mips keep them
-    // (the temporal upscaler smooths what that adds in shimmer). Settings: alpha_detail.
-    if (gbuffer_pass) {
+    alpha_lod_bias = 0.0f;
+    if (!pipeline->IsCompute()) {
         const auto* fragment = static_cast<const GraphicsPipeline*>(pipeline)->FindStage(
             Shader::SwStage::Fragment);
-        if (fragment && fragment->has_discard) {
-            sampler_lod_bias += BbSettings::AlphaDetailBias();
+        const int detail = BbSettings::Get().alpha_detail.load(std::memory_order_relaxed);
+        const bool depth_test = Regs().depth_control.depth_enable && Regs().depth_buffer.DepthValid();
+        alpha_lod_bias = TextureDetail::AlphaBias(detail, fragment && fragment->has_discard,
+                                                 gbuffer_pass, depth_test);
+        if (fragment && fragment->has_discard && (gbuffer_pass || depth_test) &&
+            detail != reported_alpha_detail) {
+            reported_alpha_detail = detail;
+            std::printf("Texture detail: alpha_detail=%d, bias %.2f, shader %016llx (%s)\n",
+                        detail, alpha_lod_bias, static_cast<unsigned long long>(fragment->pgm_hash),
+                        gbuffer_pass ? "G-buffer" : "depth/forward");
         }
     }
 
@@ -2503,7 +2514,9 @@ void Rasterizer::BindSamplers(const Shader::Info& stage, const PreparedStage* pr
         auto ssharp =
             prepared ? prepared->sampler_sharps[sampler_index] : sampler.GetSharp(stage);
         const auto vk_sampler = texture_cache.GetSampler(
-            ssharp, Regs().ta_bc_base, sampler.is_depth, sampler.is_depth ? 0.0f : sampler_lod_bias);
+            ssharp, Regs().ta_bc_base, sampler.is_depth,
+            TextureDetail::SamplerBias(sampler_lod_bias, alpha_lod_bias,
+                                       stage.sw_stage == Shader::SwStage::Fragment, sampler.is_depth));
         image_infos.emplace_back(vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
         auto& set_write = set_writes[write_index++];
         set_write.dstSet = VK_NULL_HANDLE;

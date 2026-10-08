@@ -47,6 +47,18 @@ uses the NVIDIA SDK, compiled with MSVC 2022) and copies it with `nvngx_dlss.dll
 time (`vk_dlss.cpp`), adds the Vulkan extensions NGX asks for, and DLSS gets the same inputs as
 FSR 3 (scene color, depth, render-pixel motion vectors, jitter). `BB_DLSS=0` turns it off.
 
+For the separate minimal i7-11800H / RTX 3060 6 GB / 32 GB RAM package (1080p,
+DLSS K Quality, 72 FPS), build the DLSS bridge first, then run:
+
+```bash
+bash packaging/windows/package.sh --profile rtx3060-6gb --minimal
+```
+
+See [RTX3060-6GB.md](RTX3060-6GB.md) for the profile, RAM staging limits and verification
+route. It writes `dist/bbport-windows-rtx3060-6gb.zip`, omits FSR 4 assets, and retains
+FSR 3.1 for fallback. Existing saved settings take precedence; the launcher's Advanced page
+can explicitly apply the profile. No user paths or saved games are reset.
+
 The launcher texts are written in English with the Russian beside them; the other languages
 are in `launcher/bbport_lang.py` (one list per language in the order of `KEYS`; a missing or
 empty text falls back to English). The icon (`launcher/bloodborne.ico`/`.png`) is drawn by

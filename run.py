@@ -124,6 +124,10 @@ def main():
     # As run.sh: relative paths (BB_GAME_DIR, BB_DATA_DIR, fsr4_shaders/) are from the port.
     os.chdir(PORT)
     env = os.environ
+    sys.path.insert(0, str(PORT / 'scripts'))
+    from windows_profile import load_profile
+    for name, value in load_profile(PORT).get('environment', {}).items():
+        env.setdefault(name, value)
     data = Path(env.get('BB_DATA_DIR', PORT))
     out = data / 'out'
     out.mkdir(parents=True, exist_ok=True)

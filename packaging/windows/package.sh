@@ -6,6 +6,25 @@
 # out/pyenv with PyInstaller. FSR 4 assets in fsr4_shaders/ are included when present.
 set -euo pipefail
 cd -- "$(dirname -- "$0")/../.."
+profile=
+minimal=0
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --profile)
+            [[ $# -ge 2 && $2 == rtx3060-6gb ]] || { echo 'Supported profile: rtx3060-6gb' >&2; exit 2; }
+            profile=$2; shift 2 ;;
+        --minimal) minimal=1; shift ;;
+        *) echo "Unknown option: $1" >&2; exit 2 ;;
+    esac
+done
+[[ $minimal == 0 || -n $profile ]] || { echo '--minimal requires --profile rtx3060-6gb' >&2; exit 2; }
+package=bbport-windows
+[[ -z $profile ]] || package+=-$profile
+if [[ -n $profile ]]; then
+    for required in bbport_dlss.dll nvngx_dlss.dll NVIDIA-DLSS-LICENSE.txt; do
+        [[ -s out/$required ]] || { echo "Profile needs out/$required: run packaging/windows/build_dlss.sh first" >&2; exit 1; }
+    done
+fi
 source ./msys2-env.sh
 [[ -f out/bb-probe.exe && -f out/bb-gpu-capabilities.exe && -f out/bb-play.exe ]] || { echo 'Build first: bash build.sh' >&2; exit 1; }
 
@@ -36,8 +55,8 @@ out/pyenv/Scripts/python.exe -m PyInstaller --noconfirm --clean --log-level WARN
 
 # The package is assembled in a fresh staging folder and zipped from there; dist/bbport-windows
 # (a playable copy that may hold saves and settings) is only refreshed afterwards.
-dest=out/stage/bbport-windows
-rm -rf -- out/stage
+dest=out/stage/$package
+rm -rf -- "$dest"
 mkdir -p "$dest/bin" "$dest/launcher"
 cp -r out/pyi-dist/Bloodborne/. "$dest/"
 llvm-strip -o "$dest/Play Bloodborne.exe" out/bb-play.exe
@@ -53,7 +72,23 @@ ldd "$dest/bin/bb-probe.exe" "$dest/bin/bb-gpu-capabilities.exe" |
     done
 cp -r scripts patches "$dest/"
 cp run.py LICENSE README.md packaging/windows/README-Windows.txt "$dest/"
-if [[ -d fsr4_shaders ]]; then cp -r fsr4_shaders "$dest/"; fi
+if [[ -n $profile ]]; then
+    args=(--write "$dest/windows-profile.json")
+    [[ $minimal == 0 ]] || args+=(--minimal)
+    python3 scripts/windows_profile.py "${args[@]}"
+    cp packaging/windows/RTX3060-6GB.md "$dest/"
+    # --play and direct run.py must receive the same renderer defaults as the launcher.
+    python3 - "$dest" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, 'scripts')
+from windows_profile import INI
+Path(sys.argv[1], 'bbport.ini').write_text(
+    '# RTX 3060 6 GB defaults; edit in the launcher or in-game menu\n' +
+    ''.join(f'{key}={value}\n' for key, value in INI.items()), encoding='utf-8')
+PY
+fi
+if [[ $minimal == 0 && -d fsr4_shaders ]]; then cp -r fsr4_shaders "$dest/"; fi
 # DLSS (NVIDIA RTX): the MSVC-built bridge and NVIDIA's runtime, next to bb-probe.exe
 # (packaging/windows/build_dlss.sh). Without them the DLSS option stays unavailable.
 if [[ -f out/bbport_dlss.dll && -f out/nvngx_dlss.dll ]]; then
@@ -65,21 +100,28 @@ else
 fi
 find "$dest" -name __pycache__ -prune -exec rm -r {} +
 mkdir -p dist
-rm -f dist/bbport-windows.zip
+rm -f "dist/$package.zip"
 (cd out/stage && powershell -NoProfile -Command \
-    "Compress-Archive -Path bbport-windows -DestinationPath ../../dist/bbport-windows.zip")
+    "Compress-Archive -Path '$package' -DestinationPath '../../dist/$package.zip'")
 
 # Refresh dist/bbport-windows, keeping what players create there (saves, settings, mods), and
 # only while nothing runs from it: deleting a running launcher's files breaks it.
-play=dist/bbport-windows
+play=dist/$package
 running=$(powershell -NoProfile -Command \
     "@(Get-Process | Where-Object { \$_.Path -like '$(cygpath -w "$PWD/$play")\\*' }).Count" | tr -d '\r')
 if [[ ${running:-0} != 0 ]]; then
-    echo "dist/bbport-windows is in use ($running processes): not refreshed; the zip is ready." >&2
+    echo "$play is in use ($running processes): not refreshed; the zip is ready." >&2
 else
     mkdir -p "$play"
     find "$play" -mindepth 1 -maxdepth 1 ! -name user ! -name mods ! -name bbport.ini \
         ! -name mods.json ! -name patches.json -exec rm -rf {} +
-    cp -r "$dest/." "$play/"
+    # Keep saved renderer settings; the profile can be reapplied explicitly in the launcher.
+    saved_ini=0
+    [[ ! -f $play/bbport.ini ]] || saved_ini=1
+    for item in "$dest"/* "$dest"/.[!.]*; do
+        [[ -e $item ]] || continue
+        [[ $saved_ini == 0 || $(basename "$item") != bbport.ini ]] || continue
+        cp -r "$item" "$play/"
+    done
 fi
-du -sh "$dest" dist/bbport-windows.zip
+du -sh "$dest" "dist/$package.zip"

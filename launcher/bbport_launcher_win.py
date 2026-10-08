@@ -97,6 +97,10 @@ def run_command():
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bbport_lang  # noqa: E402
+from windows_profile import load_profile  # noqa: E402
+
+WINDOWS_PROFILE = load_profile(PORT_DIR)
+MINIMAL_BUILD = WINDOWS_PROFILE.get('minimal', False)
 
 LANG = 'en'
 
@@ -168,6 +172,8 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / 'CUSA03173'
                 'frames_ahead': '', 'frame_stats': False, 'gpu_profile': False,
                 'vk_validation': False, 'extra_env': '', 'close_on_play': False,
                 'check_updates': True}
+INI_DEFAULTS.update(WINDOWS_PROFILE.get('ini', {}))
+APP_DEFAULTS.update(WINDOWS_PROFILE.get('app', {}))
 
 UPSCALERS = [('dlss', ('DLSS (NVIDIA GeForce RTX)',)),
              ('fsr4', ('FSR 4 (best quality)', 'FSR 4 (лучшее качество)')),
@@ -175,6 +181,8 @@ UPSCALERS = [('dlss', ('DLSS (NVIDIA GeForce RTX)',)),
              ('fsr3', ('FSR 3.1 (every GPU)', 'FSR 3.1 (любая видеокарта)')),
              ('taa', ('TAA (native resolution anti-aliasing)', 'TAA (нативное сглаживание)')),
              ('off', ('Off', 'Выключен'))]
+if MINIMAL_BUILD:
+    UPSCALERS = [choice for choice in UPSCALERS if choice[0] not in ('fsr4', 'fsr411')]
 # DLSS models (ini dlss_model; the in-game menu has the same list).
 DLSS_MODELS = [('auto', ('Auto (driver default)', 'Авто (выбор драйвера)')),
                ('e', ('E: CNN, light on RTX 20/30', 'E: CNN, лёгкая для RTX 20/30')),
@@ -290,6 +298,8 @@ def game_info(folder):
 
 def game_environment(s):
     env = dict(os.environ)
+    for name, value in WINDOWS_PROFILE.get('environment', {}).items():
+        env.setdefault(name, value)
     env['BB_GAME_DIR'] = s['game_dir']
     if s['user_dir']:
         env['BB_USER_DIR'] = s['user_dir']
@@ -315,6 +325,8 @@ def game_environment(s):
                       ('vk_validation', 'BB_VK_VALIDATION')):
         if s[key]:
             env[name] = '1'
+        else:
+            env.pop(name, None)
     for item in str(s['extra_env']).split():
         if '=' in item:
             key, value = item.split('=', 1)
@@ -736,27 +748,29 @@ class Launcher:
         self.check(f, 'object_motion', 'ini', _('Object motion vectors', 'Векторы движения объектов'),
                    _('Less ghosting on characters, cloth and weapons; costs about 10% FPS.',
                      'Меньше гостинга на персонажах и одежде; стоит около 10% FPS.'))
-        self.section(f, _('FSR 4 assets', 'Ассеты FSR 4'))
-        self.fsr4_label = ttk.Label(f, text='', wraplength=self.px(640), justify='left')
-        self.fsr4_label.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w')
-        holder = ttk.Frame(f)
-        holder.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(8, 0))
-        self.fsr4_button = ttk.Button(holder, text=_('Download FSR 4 assets', 'Скачать ассеты FSR 4'),
-                                      command=self.download_fsr4)
-        self.fsr4_button.pack(side='left')
-        self.fsr4_progress = ttk.Progressbar(holder, length=280, maximum=len(fsr4_files()))
-        self.fsr4_progress.pack(side='left', padx=12)
-        self.note(f, _("From FireBurn/Q2RTX on GitHub (built from AMD's MIT-licensed FidelityFX source), "
-                       'about 30 MB, into the fsr4_shaders folder of the port.',
-                       'С GitHub FireBurn/Q2RTX (собраны из MIT-исходников AMD FidelityFX), около 30 МБ, '
-                       'в папку fsr4_shaders порта.'), top=6)
+        if not MINIMAL_BUILD:
+            self.section(f, _('FSR 4 assets', 'Ассеты FSR 4'))
+            self.fsr4_label = ttk.Label(f, text='', wraplength=self.px(640), justify='left')
+            self.fsr4_label.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w')
+            holder = ttk.Frame(f)
+            holder.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(8, 0))
+            self.fsr4_button = ttk.Button(holder, text=_('Download FSR 4 assets', 'Скачать ассеты FSR 4'),
+                                          command=self.download_fsr4)
+            self.fsr4_button.pack(side='left')
+            self.fsr4_progress = ttk.Progressbar(holder, length=280, maximum=len(fsr4_files()))
+            self.fsr4_progress.pack(side='left', padx=12)
+            self.note(f, _("From FireBurn/Q2RTX on GitHub (built from AMD's MIT-licensed FidelityFX source), "
+                           'about 30 MB, into the fsr4_shaders folder of the port.',
+                           'С GitHub FireBurn/Q2RTX (собраны из MIT-исходников AMD FidelityFX), около 30 МБ, '
+                           'в папку fsr4_shaders порта.'), top=6)
         self.section(f, _('Detail', 'Детализация'))
         self.row(f, _('Model detail (LOD)', 'Детализация моделей'), self.choice(f, 'model_lod', 'ini', LODS),
-                 _('A game patch (game version 1.09).', 'Патч игры (версия 1.09).'))
+                 _('Model LOD patch (game 1.09); requires restarting. Does not change object visibility.',
+                   'Патч LOD моделей (игра 1.09); нужен перезапуск. Не меняет дальность видимости объектов.'))
         self.row(f, _('Grates, fences, foliage at a distance', 'Решётки, ограды, листва вдали'),
                  self.choice(f, 'alpha_detail', 'ini', ALPHA_DETAIL),
-                 _('Thin bars no longer break up far away and pop in up close. Changes in the game too.',
-                   'Тонкие прутья не рассыпаются вдали и не «дорисовываются» вблизи. Меняется и в игре.'))
+                 _('Sharper alpha textures; changes live. Geometry visibility and streaming are unchanged.',
+                   'Чётче текстуры с вырезами; меняется сразу. Дальность видимости и загрузка моделей не меняются.'))
         self.check(f, 'show_fps', 'ini', _('Show the FPS counter', 'Показывать FPS'))
 
     def build_display(self):
@@ -880,6 +894,12 @@ class Launcher:
                                  'Если игра показывает только чёрный экран, обычно это помогает.'),
                   style='Muted.TLabel').pack(side='left', padx=10)
         self.section(f, _('Performance', 'Производительность'))
+        if WINDOWS_PROFILE:
+            holder = ttk.Frame(f)
+            holder.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(6, 8))
+            ttk.Button(holder, text=_('Apply RTX 3060 6 GB profile (72 FPS)',
+                                     'Применить профиль RTX 3060 6 ГБ (72 FPS)'),
+                       command=self.apply_windows_profile).pack(side='left')
         self.row(f, _('Two-stage GPU pipeline', 'Двухстадийный конвейер GPU'), self.choice(f, 'draw_pipe', 'app', DRAW_PIPE),
                  _('20–30% faster; switch it off if the game is unstable.', 'Быстрее на 20–30%; при нестабильности выключите.'))
         self.row(f, _('GPU readbacks', 'Чтение данных GPU'), self.choice(f, 'readbacks', 'app', READBACKS),
@@ -991,6 +1011,8 @@ class Launcher:
         self.ui_calls.put(self.refresh_status)
 
     def refresh_fsr4(self):
+        if MINIMAL_BUILD:
+            return
         total, missing = len(fsr4_files()), len(fsr4_missing())
         self.fsr4_progress.configure(value=total - missing)
         self.fsr4_label.configure(
@@ -1078,6 +1100,14 @@ class Launcher:
         if 0 <= other < len(self.mod_order):
             self.mod_order[index], self.mod_order[other] = self.mod_order[other], self.mod_order[index]
             self.refresh_lists()
+
+    def apply_windows_profile(self):
+        for key, value in WINDOWS_PROFILE.get('ini', {}).items():
+            self.var(key, 'ini').set(value == '1' if key in INI_FLAGS else
+                                     float(value) if key == 'sharpness' else value)
+        for key, value in WINDOWS_PROFILE.get('app', {}).items():
+            self.var(key, 'app').set(value)
+        self.collect()
 
     def collect(self):
         """Writes settings.json, bbport.ini, mods.json and patches.json."""
@@ -1203,6 +1233,12 @@ class Launcher:
     # ---- updates -------------------------------------------------------------------------------
     def check_update(self, manual=False):
         """Helper thread: asks GitHub for the newest release and offers it when it is newer."""
+        if WINDOWS_PROFILE:
+            if manual:
+                self.ui_calls.put(lambda: self.messagebox.showinfo(
+                    'Bloodborne', _('This custom build is updated with a new profile package.',
+                                     'Эта сборка обновляется новым пакетом с профилем.')))
+            return
         try:
             version, url, page = latest_release()
         except (OSError, ValueError, KeyError) as failure:

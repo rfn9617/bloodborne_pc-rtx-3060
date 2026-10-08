@@ -55,7 +55,7 @@ public:
     /// SampleProxy for a view obtained before (valid while Generation() is unchanged): the
     /// layout to sample it in.
     vk::ImageLayout PrepareSample(const VideoCore::Image& image, u32 level = 0);
-    /// Changes when proxies and their views are destroyed (SetSize).
+    /// Changes when proxies and their views are retired (SetSize or CollectDeleted).
     [[nodiscard]] u64 Generation() const noexcept {
         return generation;
     }
@@ -64,6 +64,9 @@ public:
         return !copying && tracked.contains(image_uid);
     }
     void ResolveAll();
+    /// Retire proxies whose original texture was deleted/replaced, without a GPU-wide wait.
+    void CollectDeleted();
+    [[nodiscard]] size_t ProxyCount() const noexcept { return entries.size(); }
     bool debug = false; ///< BB_SCENE_DEBUG frame: print resolves and fills
 private:
     struct Entry {

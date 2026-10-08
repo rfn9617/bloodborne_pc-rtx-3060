@@ -86,8 +86,8 @@ struct Values {
     std::atomic<bool> effects[EffectCount]{};
     std::atomic<int> model_lod{0}; ///< -4 ultra, -2 highest .. 2 lowest, 0 the game's
     /// Alpha-tested surfaces (grates, fences, foliage, hair): extra sharper mip levels in the
-    /// G-buffer, AlphaDetailBias(). 0 off .. 3; live. Thin bars no longer thin out and break
-    /// up with distance (their alpha averaged away in the smaller mips) and pop in up close.
+    /// material and depth passes. 0 off .. 3; live. Sharper mips can preserve thin bars when
+    /// their alpha would be averaged away; does not change geometry culling or streaming.
     std::atomic<int> alpha_detail{2};
     std::atomic<int> output_res{OutputDefault}; ///< index into OutputWidths
     /// Live resolution and preset changes (run.sh): 0 off by default (startup patch, fastest
