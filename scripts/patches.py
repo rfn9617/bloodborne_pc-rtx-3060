@@ -48,8 +48,8 @@ EFFECTS={
     'tweak_easy_run':(None,'Sensitive Analog Input (easier to run)'),
     'tweak_ragdoll':(None,'DS1-like physics'),
 }
-# model_lod: -2 highest, 0 the game's, 1 lower, 2 lowest.
-MODEL_LOD={'-2':'Model LOD -2 (Highest)','1':'Model LOD 1 (Lower)','2':'Model LOD 2 (Lowest)'}
+# model_lod: -4 ultra, -2 highest, 0 the game's, 1 lower, 2 lowest.
+MODEL_LOD={'-4':'Model LOD -4 (Ultra)','-2':'Model LOD -2 (Highest)','1':'Model LOD 1 (Lower)','2':'Model LOD 2 (Lowest)'}
 
 
 def game_app_version(game):

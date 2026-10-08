@@ -20,6 +20,7 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "bbport_threads.h"
+#include "bbport_settings.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
@@ -1542,14 +1543,27 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     // size; the temporal upscaler restores the detail of the output's mip level (FSR guide:
     // log2(render / output)). Shadows, post-processing and UI keep the guest's bias.
     sampler_lod_bias = 0.0f;
-    if (!pipeline->IsCompute() && !BbToggle::Disabled(BbToggle::SceneMipBias) &&
+    const bool gbuffer_pass =
+        !pipeline->IsCompute() &&
         std::popcount(static_cast<const GraphicsPipeline*>(pipeline)->GetGraphicsKey().mrt_mask &
-                      0xff) >= 5) {
+                      0xff) >= 5;
+    if (gbuffer_pass && !BbToggle::Disabled(BbToggle::SceneMipBias)) {
         sampler_lod_bias = upscaler->SceneMipBias();
         static float reported = 0.0f;
         if (sampler_lod_bias != reported) {
             reported = sampler_lod_bias;
             std::printf("Upscaler: scene texture LOD bias %.2f\n", sampler_lod_bias);
+        }
+    }
+    // bbport: alpha-tested surfaces (the pixel shader discards): iron grates, fences, foliage.
+    // Their thin parts live in the alpha channel; smaller mips average it below the cutoff, so
+    // at a distance bars break up and vanish, then pop back in up close. Sharper mips keep them
+    // (the temporal upscaler smooths what that adds in shimmer). Settings: alpha_detail.
+    if (gbuffer_pass) {
+        const auto* fragment = static_cast<const GraphicsPipeline*>(pipeline)->FindStage(
+            Shader::SwStage::Fragment);
+        if (fragment && fragment->has_discard) {
+            sampler_lod_bias += BbSettings::AlphaDetailBias();
         }
     }
 

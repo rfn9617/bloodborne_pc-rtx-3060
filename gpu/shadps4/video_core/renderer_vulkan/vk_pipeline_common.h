@@ -53,6 +53,11 @@ public:
         return *stages[u32(stage)];
     }
 
+    /// bbport: null when the pipeline has no such stage (depth-only passes have no fragment).
+    const Shader::Info* FindStage(Shader::SwStage stage) const noexcept {
+        return stages[u32(stage)];
+    }
+
     bool IsCompute() const {
         return is_compute;
     }

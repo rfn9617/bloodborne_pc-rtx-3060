@@ -314,6 +314,11 @@
             <Line Type="bytes" Address="0x0216fc09" Value="b90100000090"/>
         </PatchList>
     </Metadata>
+    <Metadata Title="Bloodborne" Name="Model LOD -4 (Ultra)" Note="bbport: the game clamps the level to 0..2 after adding this offset (0x216fc11), so -4 keeps the full model for objects two LOD steps further away than -2." Author="bbport (from Kyo, auser1337)" PatchVer="1.0" AppVer="01.09" AppElf="eboot.bin" isEnabled="false">
+        <PatchList>
+            <Line Type="bytes" Address="0x0216fc09" Value="b9FCFFFFFF90"/>
+        </PatchList>
+    </Metadata>
     <Metadata Title="Bloodborne" Name="Model LOD -2 (Highest)" Note="Highest model detail, performance increase. Affects visuals, Higher model LOD." Author="Kyo, auser1337" PatchVer="1.0" AppVer="01.09" AppElf="eboot.bin" isEnabled="false">
         <PatchList>
             <Line Type="bytes" Address="0x0216fc09" Value="b9FEFFFFFF90"/>

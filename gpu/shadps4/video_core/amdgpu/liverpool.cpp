@@ -86,11 +86,16 @@ Liverpool::~Liverpool() {
 }
 
 void Liverpool::ProcessCommands() {
-    if (num_commands && rasterizer) {
-        rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCommands); // bbport: commands touch the caches
-    }
     // Process incoming commands with high priority
     while (num_commands) {
+        // bbport (base port 0.4): commands touch the caches and record into the scheduler, so
+        // the draw recording thread must be idle. Drained per command: draining only when the
+        // first check saw one let a command that arrived between the two checks run beside the
+        // recording thread - two threads in the scheduler's chunks (a null record chunk crash
+        // in DynamicState::CommitWith, lost chunks, frozen games).
+        if (rasterizer) {
+            rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCommands);
+        }
         Common::UniqueFunction<void> callback{};
         {
             std::scoped_lock lk{submit_mutex};

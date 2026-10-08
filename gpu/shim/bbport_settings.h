@@ -84,7 +84,11 @@ struct Values {
     std::atomic<int> active_render_width{1920}, active_render_height{1080};
     /// Applied at start (patches.py); the menu shows when a restart is needed.
     std::atomic<bool> effects[EffectCount]{};
-    std::atomic<int> model_lod{0}; ///< -2 highest .. 2 lowest, 0 the game's
+    std::atomic<int> model_lod{0}; ///< -4 ultra, -2 highest .. 2 lowest, 0 the game's
+    /// Alpha-tested surfaces (grates, fences, foliage, hair): extra sharper mip levels in the
+    /// G-buffer, AlphaDetailBias(). 0 off .. 3; live. Thin bars no longer thin out and break
+    /// up with distance (their alpha averaged away in the smaller mips) and pop in up close.
+    std::atomic<int> alpha_detail{2};
     std::atomic<int> output_res{OutputDefault}; ///< index into OutputWidths
     /// Live resolution and preset changes (run.sh): 0 off by default (startup patch, fastest
     /// on the Steam Deck and older GPUs), -1 auto (strong discrete GPUs), 1 on. On restart.
@@ -127,5 +131,10 @@ const char* PresetName(int preset);
 const char* UpscalerName(int upscaler);
 /// ini name of a DLSS model value ("auto", "k", ...).
 const char* DlssModelName(int model);
+/// Texture LOD bias added for alpha-tested G-buffer draws (alpha_detail): 0, -0.5, -1, -1.5.
+inline float AlphaDetailBias() {
+    return -0.5f * float(Get().alpha_detail.load(std::memory_order_relaxed));
+}
+inline constexpr int AlphaDetailCount = 4;
 
 } // namespace BbSettings

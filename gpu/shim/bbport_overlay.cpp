@@ -367,15 +367,31 @@ void Menu() {
          "остаётся в 1080p — на Steam Deck и старых видеокартах это заметно медленнее. "
          "Выключена: всё рисуется в разрешении пресета, смена — через перезапуск. Авто включает "
          "её на мощных дискретных видеокартах. Применяется после перезапуска игры.");
+    {
+        static const char* levels[] = {"Как в игре", "Выше", "Высокая", "Максимальная"};
+        const int current = std::clamp(s.alpha_detail.load(), 0, BbSettings::AlphaDetailCount - 1);
+        if (ImGui::BeginCombo("Решётки, ограды, листва вдали", levels[current])) {
+            for (int i = 0; i < BbSettings::AlphaDetailCount; ++i) {
+                if (ImGui::Selectable(levels[i], i == current)) {
+                    Store(s.alpha_detail, i, i != current);
+                }
+            }
+            ImGui::EndCombo();
+        }
+        Hint("Поверхности с вырезами по альфе (кованые решётки, ограды, листва) берут более "
+             "чёткие уровни текстур: тонкие прутья не рассыпаются вдали и не «дорисовываются» "
+             "при приближении. Сразу, без перезапуска.");
+    }
     ImGui::SeparatorText("Эффекты игры (после перезапуска)");
-    static const char* lods[] = {"Максимальная (-2)", "Как в игре", "Ниже (1)", "Минимальная (2)"};
-    static constexpr int lod_values[] = {-2, 0, 1, 2};
-    int lod_index = 1;
-    for (int i = 0; i < 4; ++i) {
+    static const char* lods[] = {"Ультра (-4)", "Максимальная (-2)", "Как в игре", "Ниже (1)",
+                                 "Минимальная (2)"};
+    static constexpr int lod_values[] = {-4, -2, 0, 1, 2};
+    int lod_index = 2;
+    for (int i = 0; i < 5; ++i) {
         if (lod_values[i] == s.model_lod) lod_index = i;
     }
     if (ImGui::BeginCombo("Детализация моделей", lods[lod_index])) {
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < 5; ++i) {
             if (ImGui::Selectable(lods[i], i == lod_index)) {
                 Store(s.model_lod, lod_values[i], true);
             }

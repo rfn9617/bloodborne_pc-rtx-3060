@@ -159,7 +159,7 @@ TWEAKS = [
 INI_FLAGS = {'sharpen', 'object_motion', 'show_fps', *(k for k, _t, _o in EFFECTS + EXTRAS + CHEATS + TWEAKS)}
 INI_DEFAULTS = {'upscaler': 'fsr4', 'preset': '1', 'sharpen': '1', 'sharpness': '0.50',
                 'object_motion': '1', 'show_fps': '1', 'output_res': '1920x1080', 'model_lod': '0',
-                'live_resolution': 'auto', 'dlss_model': 'auto',
+                'live_resolution': 'auto', 'dlss_model': 'auto', 'alpha_detail': '2',
                 **{key: '1' if on else '0' for key, _t, on in EFFECTS + EXTRAS + CHEATS + TWEAKS}}
 APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / 'CUSA03173'), 'user_dir': '',
                 'mods_dir': '', 'mods_enabled': True, 'patches_dir': '', 'language': '1',
@@ -188,7 +188,11 @@ OUTPUTS = [('1280x720', ('1280 × 720 (Steam Deck)',)), ('1920x1080', ('1920 × 
 LIVE = [('auto', ('Auto (by graphics card)', 'Авто (по видеокарте)')), ('0', ('Off (faster)', 'Выключена (быстрее)')),
         ('1', ('On (change without restarting)', 'Включена (без перезапуска)'))]
 LODS = [('0', ('As in the game', 'Как в игре')), ('-2', ('Highest (−2)', 'Максимальная (−2)')),
+        ('-4', ('Ultra (−4, far objects too)', 'Ультра (−4, и дальние объекты)')),
         ('1', ('Lower (1)', 'Ниже (1)')), ('2', ('Lowest (2)', 'Минимальная (2)'))]
+# Alpha-tested detail (ini alpha_detail): sharper texture levels for grates, fences, foliage.
+ALPHA_DETAIL = [('0', ('As in the game', 'Как в игре')), ('1', ('Higher', 'Выше')),
+                ('2', ('High (recommended)', 'Высокая (рекомендуется)')), ('3', ('Maximum', 'Максимальная'))]
 FPS_MODES = [('uncap', ('Unlocked (frame-time patch)', 'Без ограничения (патч)')), ('60', ('60 FPS',)),
              ('90', ('90 FPS',)), ('30', ('30 FPS (as on PS4)', '30 FPS (как на PS4)'))]
 PRESENT_MODES = [('Mailbox', ('Mailbox (low latency, no tearing)', 'Mailbox (без разрывов)')),
@@ -749,6 +753,10 @@ class Launcher:
         self.section(f, _('Detail', 'Детализация'))
         self.row(f, _('Model detail (LOD)', 'Детализация моделей'), self.choice(f, 'model_lod', 'ini', LODS),
                  _('A game patch (game version 1.09).', 'Патч игры (версия 1.09).'))
+        self.row(f, _('Grates, fences, foliage at a distance', 'Решётки, ограды, листва вдали'),
+                 self.choice(f, 'alpha_detail', 'ini', ALPHA_DETAIL),
+                 _('Thin bars no longer break up far away and pop in up close. Changes in the game too.',
+                   'Тонкие прутья не рассыпаются вдали и не «дорисовываются» вблизи. Меняется и в игре.'))
         self.check(f, 'show_fps', 'ini', _('Show the FPS counter', 'Показывать FPS'))
 
     def build_display(self):
