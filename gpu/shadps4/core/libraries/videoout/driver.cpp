@@ -12,6 +12,8 @@
 #endif
 #include "common/assert.h"
 #include "bbport_toggles.h"
+#include "bbport_vblank_clock.h"
+#include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
 #include "common/debug.h"
 #include "common/thread.h"
@@ -600,6 +602,39 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     std::printf("VideoOut: vblank %u Hz, frame limit %u FPS\n",
                 EmulatorSettings.GetVblankFrequency(), frame_limit);
 
+    // bbport: a frame limit that divides the display refresh (72 on 144 Hz, 60 on 120 Hz, 60 on
+    // 60 Hz) is locked to the display: each flip goes out just after a real refresh, `divisor`
+    // refreshes after the previous one, so every frame stays on screen equally long. The CPU
+    // timer alone drifted against the display and showed some frames for three refreshes and
+    // the next for one (judder invisible in frame times). BB_VSYNC_LOCK=0 keeps the timer.
+    const u32 display_hz = BbDisplayRefreshHz();
+    u32 divisor = 0;
+    if (frame_limit != 0 && display_hz >= frame_limit) {
+        const u32 d = (display_hz + frame_limit / 2) / frame_limit;
+        const double locked_fps = double(display_hz) / d;
+        if (d >= 1 && std::abs(locked_fps - frame_limit) <= 1.0) {
+            divisor = d;
+        }
+    }
+    const char* lock_env = std::getenv("BB_VSYNC_LOCK");
+    bool vsync_lock = divisor != 0 && !(lock_env && lock_env[0] == '0');
+    bool vsync_lock_started = false;
+    // Just after the refresh: the presentation pass has most of a refresh to reach the screen.
+    const auto lock_offset = std::chrono::microseconds([] {
+        const char* env = std::getenv("BB_VSYNC_LOCK_OFFSET_US");
+        return env ? std::strtol(env, nullptr, 10) : 500L;
+    }());
+    // The slot after a flip at `now`: `divisor` refreshes after the refresh just before it.
+    const auto next_slot = [&](std::chrono::steady_clock::time_point now) {
+        BbVblank::Sample vb{};
+        if (vsync_lock && BbVblank::Latest(vb) && vb.time <= now) {
+            const auto since = now - vb.time;
+            const auto last_refresh = vb.time + vb.period * (since / vb.period);
+            return std::max(last_refresh + vb.period * divisor + lock_offset, now - frame_period);
+        }
+        return std::max(next_flip + frame_period, now - frame_period);
+    };
+
     const auto receive_request = [this] -> Request {
         std::scoped_lock lk{mutex};
         if (!requests.empty()) {
@@ -617,6 +652,16 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     while (!token.stop_requested()) {
         timer.Start();
         const auto tick_deadline = std::chrono::steady_clock::now() + vblank_period;
+        if (vsync_lock && !vsync_lock_started && presenter) {
+            vsync_lock_started = true;
+            vsync_lock = BbVblank::Start(presenter->GetWindow().GetWindowInfo().render_surface);
+            if (vsync_lock) {
+                std::printf("VideoOut: frame limit locked to the display: one frame every %u "
+                            "refresh(es) of %u Hz\n", divisor, display_hz);
+            } else {
+                std::printf("VideoOut: frame limit on the CPU timer\n");
+            }
+        }
 
         if (DebugState.IsGuestThreadsPaused()) {
             DrawLastFrame();
@@ -631,7 +676,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         if (flip_slot && vblank_status.count % (main_port.flip_rate + 1) == 0) {
             const auto request = receive_request();
             if (request && frame_limit) {
-                next_flip = std::max(next_flip + frame_period, now - frame_period);
+                next_flip = next_slot(now);
             }
             if (!request) {
                 if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
@@ -692,7 +737,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             const auto now = std::chrono::steady_clock::now();
             const auto request = receive_request();
             if (request) {
-                next_flip = std::max(next_flip + frame_period, now - frame_period);
+                next_flip = next_slot(now);
                 Flip(request);
                 FRAME_END;
             }
