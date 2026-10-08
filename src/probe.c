@@ -169,12 +169,42 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
                  (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)rip,&module) && module==self) ||
                  !module;
         if (ours) return fatal_exception(info);
+        /* bbport: a fault in a driver or system library is left to that module's own handler;
+         * noted (the first few) so a process that then ends without a report has a trace. */
+        static volatile LONG foreign_faults;
+        if (code!=EXCEPTION_STACK_OVERFLOW && InterlockedIncrement(&foreign_faults)<=8) {
+            char where[MAX_PATH+64];
+            describe_address(where,sizeof(where),rip);
+            fprintf(stderr,"Note: exception 0x%08lx at %s (thread %lu), left to that library's handler\n",
+                    code,where,GetCurrentThreadId());
+        }
     }
     /* BB_STRICT_HANDLES=1: a closed or invalid handle used anywhere is reported (diagnostics). */
     if (code==0xC0000008 /* STATUS_INVALID_HANDLE */) return fatal_exception(info);
     return EXCEPTION_CONTINUE_SEARCH;
 }
 static LONG WINAPI unhandled_fault(EXCEPTION_POINTERS *info) { return fatal_exception(info); }
+/* bbport: console control events. Started from the launcher the game's console has no window,
+ * so nobody can have pressed Ctrl+C there: such an event is noted and ignored instead of ending
+ * the game. With a visible console (run.py from a terminal) Ctrl+C still ends it. */
+static BOOL WINAPI console_event(DWORD type) {
+    static const char *const names[]={"Ctrl+C","Ctrl+Break","console closed","?","?","logoff","shutdown"};
+    const int ignore=(type==CTRL_C_EVENT || type==CTRL_BREAK_EVENT) && !GetConsoleWindow();
+    fprintf(stderr,"Runtime: console event %s%s\n",type<7 ? names[type] : "?",ignore ? " ignored (no console window)" : "");
+    fflush(stderr);
+    return ignore ? TRUE : FALSE;
+}
+/* bbport: a last line whenever the process ends through ExitProcess, from any module (the TLS
+ * callback runs on process detach; TerminateProcess from outside skips it). Plain WriteFile:
+ * the other threads are gone and may have held the stdio locks. */
+static void NTAPI exit_notice(PVOID module, DWORD reason, PVOID reserved) {
+    (void)module;
+    if (reason!=DLL_PROCESS_DETACH || !reserved) return;
+    static const char text[]="Runtime: process exit\n";
+    DWORD written;
+    WriteFile(GetStdHandle(STD_ERROR_HANDLE),text,sizeof(text)-1,&written,NULL);
+}
+__attribute__((used,section(".CRT$XLB"))) PIMAGE_TLS_CALLBACK bb_exit_notice=exit_notice;
 /* Guest code reads its TCB with `mov rax, gs:[0]` (link_*.py rewrote fs:[0]); on Windows
  * the displacement becomes the TEB TLS slot that holds the guest TCB (runtime_thread.c). */
 uint32_t runtime_thread_tcb_offset(void);
@@ -434,6 +464,9 @@ int main(int argc, char **argv) {
     SYSTEM_INFO system_info; GetSystemInfo(&system_info); page_size = system_info.dwPageSize;
     AddVectoredExceptionHandler(1, vectored_fault);
     SetUnhandledExceptionFilter(unhandled_fault);
+    SetConsoleCtrlHandler(console_event,TRUE);
+    /* SDL would turn Ctrl+C into a silent quit; console_event decides instead. */
+    if (!getenv("SDL_NO_SIGNAL_HANDLERS")) SetEnvironmentVariableA("SDL_NO_SIGNAL_HANDLERS","1");
     if (getenv("BB_STRICT_HANDLES")) {
         PROCESS_MITIGATION_STRICT_HANDLE_CHECK_POLICY strict={0};
         strict.RaiseExceptionOnInvalidHandleReference=1;

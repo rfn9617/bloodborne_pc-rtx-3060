@@ -1,4 +1,5 @@
 // bbport: SDL3 window for the Vulkan swapchain (X11 or Wayland).
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <SDL3/SDL.h>
@@ -51,6 +52,43 @@ struct CursorAutoHide {
     }
 };
 CursorAutoHide cursor;
+
+// bbport: why the window closes, in the log. The port ends at once afterwards with exit code 0,
+// which the launcher shows the same way for every close; without this line a close that the
+// player did not ask for cannot be told apart from a normal one.
+struct CloseReport {
+    Uint32 first = 0;     ///< the first close event of this batch (CLOSE_REQUESTED or QUIT)
+    bool alt_f4 = false;  ///< Alt+F4 seen in the same batch of events
+
+    void OnEvent(const SDL_Event& event) {
+        if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F4 &&
+            (event.key.mod & SDL_KMOD_ALT)) {
+            alt_f4 = true;
+        }
+        if (!first && (event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED || event.type == SDL_EVENT_QUIT)) {
+            first = event.type;
+        }
+    }
+
+    void Print(SDL_Window* window) const {
+        // SDL reports Alt+F4 before the key itself: the keyboard state still has F4 down.
+        const bool* keys = SDL_GetKeyboardState(nullptr);
+        const bool alt = (SDL_GetModState() & SDL_KMOD_ALT) != 0;
+        const char* why;
+        if (first == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
+            why = alt_f4 || (alt && keys && keys[SDL_SCANCODE_F4])
+                      ? "Alt+F4"
+                      : "a close request (the window's close button, the taskbar or another program)";
+        } else {
+            why = "a quit request from the system (console Ctrl+C or Break, a termination signal, logoff)";
+        }
+        const SDL_WindowFlags flags = SDL_GetWindowFlags(window);
+        std::fprintf(stderr, "Window: closing on %s; the window %s keyboard focus%s\n", why,
+                     (flags & SDL_WINDOW_INPUT_FOCUS) ? "had" : "did not have",
+                     (flags & SDL_WINDOW_FULLSCREEN) ? ", fullscreen" : "");
+        std::fflush(stderr);
+    }
+};
 } // namespace
 
 WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}, height{height_} {
@@ -138,8 +176,10 @@ bool WindowSDL::PollEvents() {
         BbOverlay::UpdateTextInput(window);
     }
     SDL_Event event;
+    CloseReport close;
     while (SDL_PollEvent(&event)) {
         cursor.OnEvent(event);
+        close.OnEvent(event);
         if (text_active && (event.type == SDL_EVENT_TEXT_INPUT || event.type == SDL_EVENT_KEY_DOWN)) {
             std::scoped_lock lock{text_mutex};
             if (event.type == SDL_EVENT_TEXT_INPUT) {
@@ -188,6 +228,9 @@ bool WindowSDL::PollEvents() {
         }
     }
     cursor.Apply();
+    if (!is_open && close.first) {
+        close.Print(window);
+    }
     return is_open;
 }
 
