@@ -68,7 +68,7 @@ static u32 submission_lock{};
 std::condition_variable cv_lock{};
 std::mutex m_wait_idle{};
 std::mutex m_submit_lock{};
-static u64 frames_submitted{};      // frame counter
+static std::atomic<u64> frames_submitted{}; // frame counter (bbport: atomic, StallWatch)
 static bool send_init_packet{true}; // initialize HW state before first game's submit in a frame
 static s32 sdk_version{0};
 
@@ -78,8 +78,53 @@ static u32 asc_next_offs_dw[Liverpool::NumComputeRings];
 static VAddr tessellation_factors_ring_addr = -1;
 static constexpr u32 tessellation_offchip_buffer_size = 0x800000u;
 
+// bbport: Liverpool::SubmissionsTotal() when sceGnmSubmitDone set the lock. A GPU idle reported
+// for fewer submissions (checked just before a new one arrived) leaves the lock set: that work
+// is not decoded yet, and the guest reuses its command buffers once the lock is gone.
+static u64 lock_generation{};
+
+// bbport: a frozen game leaves a line in the log. The guest ends every frame with
+// sceGnmSubmitDone; when none comes for 5 s (after the first), the submission state is printed
+// once (a freeze in the GPU thread, the guest waiting for a lock or for a fence that never comes
+// look different here). Read without locks: whoever is stuck may hold them.
+static void StallWatch() {
+    std::thread([] {
+        u64 last = 0;
+        int quiet = 0;
+        bool reported = false;
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            const u64 now = frames_submitted.load(std::memory_order_relaxed);
+            if (now != last || now == 0) {
+                if (reported && now != last) {
+                    std::printf("Stall: frames again after %d s\n", quiet);
+                }
+                last = now;
+                quiet = 0;
+                reported = false;
+                continue;
+            }
+            if (++quiet == 5 && !reported) {
+                reported = true;
+                std::printf("Stall: no frame from the game for 5 s (frame %llu): %u submissions "
+                            "not decoded, GPU %s; submission lock %s (set at submission %llu, "
+                            "GPU idle reported at %llu, %llu submitted)\n",
+                            (unsigned long long)now, liverpool->PendingSubmits(),
+                            liverpool->IsGpuIdle() ? "idle" : "busy",
+                            submission_lock ? "on" : "off", (unsigned long long)lock_generation,
+                            (unsigned long long)liverpool->IdleGeneration(),
+                            (unsigned long long)liverpool->SubmissionsTotalRelaxed());
+                std::fflush(stdout);
+            }
+        }
+    }).detach();
+}
+
 static void ResetSubmissionLock(Platform::InterruptId irq) {
     std::unique_lock lock{m_wait_idle};
+    if (submission_lock && liverpool->IdleGeneration() < lock_generation) {
+        return;
+    }
     submission_lock = 0;
     cv_lock.notify_all();
 }
@@ -2357,8 +2402,12 @@ s32 PS4_SYSV_ABI sceGnmSubmitDone() {
     LOG_DEBUG(Lib_GnmDriver, "called");
     std::scoped_lock lk{m_submit_lock};
     WaitGpuIdle();
-    if (!liverpool->IsGpuIdle()) {
-        submission_lock = true;
+    {
+        std::unique_lock lock{m_wait_idle};
+        if (!liverpool->IsGpuIdle()) {
+            submission_lock = true;
+            lock_generation = liverpool->SubmissionsTotal();
+        }
     }
     liverpool->SubmitDone();
     send_init_packet = true;
@@ -2921,6 +2970,7 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LOG_INFO(Lib_GnmDriver, "Initializing presenter");
     liverpool = std::make_unique<AmdGpu::Liverpool>();
     presenter = std::make_unique<Vulkan::Presenter>(*g_window, liverpool.get());
+    StallWatch();
 
     const s32 result = sceKernelGetCompiledSdkVersion(&sdk_version);
     if (result != ORBIS_OK) {

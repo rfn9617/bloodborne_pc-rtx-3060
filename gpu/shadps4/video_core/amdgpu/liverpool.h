@@ -122,6 +122,23 @@ public:
         return num_submits == 0 && (work_retired || !use_retired);
     }
 
+    /// bbport: submissions made so far (the submission lock records it, gnmdriver.cpp).
+    u64 SubmissionsTotal() {
+        std::scoped_lock lk{submit_mutex};
+        return submissions_total;
+    }
+    /// bbport: for the stall report (no locks: the GPU thread may hold them).
+    u32 PendingSubmits() const {
+        return num_submits.load(std::memory_order_relaxed);
+    }
+    u64 SubmissionsTotalRelaxed() const {
+        return submissions_total.load(std::memory_order_relaxed);
+    }
+    /// bbport: SubmissionsTotal() at the last GPU idle interrupt: all of it decoded and done.
+    u64 IdleGeneration() const {
+        return idle_generation.load(std::memory_order_acquire);
+    }
+
     void SetVoPort(Libraries::VideoOut::VideoOutPort* port) {
         vo_port = port;
     }
@@ -271,6 +288,11 @@ private:
     /// decrements num_submits once it has decoded a submission, before that). Under
     /// submit_mutex with num_submits.
     std::atomic<bool> work_retired{true};
+    /// bbport: submissions so far (under submit_mutex) and the count at the last GPU idle
+    /// interrupt: an idle reported for earlier work must not release the submission lock that
+    /// sceGnmSubmitDone set for later work (see Process).
+    std::atomic<u64> submissions_total{};
+    std::atomic<u64> idle_generation{};
     std::atomic<u32> num_commands{};
     std::atomic<bool> submit_done{};
     std::mutex submit_mutex;

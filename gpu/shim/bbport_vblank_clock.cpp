@@ -18,6 +18,7 @@ namespace {
 std::mutex mutex;
 Sample latest{};
 bool have_sample = false;
+unsigned rejected = 0; ///< deltas in a row that did not match the period
 std::atomic<bool> running{false};
 std::atomic<bool> stop_requested{false};
 
@@ -33,6 +34,12 @@ void Publish(std::chrono::steady_clock::time_point now) {
             latest.period += (std::chrono::duration_cast<std::chrono::nanoseconds>(delta) -
                               latest.period) /
                              16;
+            rejected = 0;
+        } else if (++rejected > 32) {
+            // Not a missed blank but another period (a first measurement taken across a stall,
+            // the display switched to another refresh rate): start over from this one.
+            latest.period = std::chrono::duration_cast<std::chrono::nanoseconds>(delta);
+            rejected = 0;
         }
     }
     latest.time = now;

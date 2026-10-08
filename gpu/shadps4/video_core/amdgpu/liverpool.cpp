@@ -182,13 +182,27 @@ void Liverpool::Process(std::stop_token stoken) {
             rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonSubmissionEnd);
             rasterizer->WaitDeferredSignals();
         }
+        // GPU idle only if nothing was submitted meanwhile (base port 0.3): the drain and the
+        // deferred fences take milliseconds, and a submission plus sceGnmSubmitDone in that time
+        // set the submission lock for work not even decoded yet. Releasing it then let the guest
+        // reuse that frame's command buffers, decoded afterwards as garbage ("Unimplemented PM4
+        // type 0", a crash minutes into play). The loop runs again for the new submissions and
+        // signals once they are done; the generation keeps a late signal from releasing a lock
+        // set after this check (ResetSubmissionLock).
+        bool idle;
+        u64 generation;
         {
             std::scoped_lock lk{submit_mutex};
-            if (num_submits == 0) {
+            idle = num_submits == 0;
+            generation = submissions_total;
+            if (idle) {
                 work_retired = true;
             }
         }
-        Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
+        if (idle) {
+            idle_generation.store(generation, std::memory_order_release);
+            Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
+        }
     }
 }
 
@@ -1690,6 +1704,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
 
     std::scoped_lock lk{submit_mutex};
     ++num_submits;
+    ++submissions_total;
     work_retired = false;
     submit_cv.notify_one();
 }
@@ -1708,6 +1723,7 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     std::scoped_lock lk{submit_mutex};
     num_mapped_queues = std::max(num_mapped_queues, gnm_vqid + 1);
     ++num_submits;
+    ++submissions_total;
     work_retired = false;
     submit_cv.notify_one();
 }
