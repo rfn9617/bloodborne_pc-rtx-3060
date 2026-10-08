@@ -9,6 +9,50 @@
 
 namespace Frontend {
 
+namespace {
+// bbport: the mouse cursor over the game window, as in PC games: hidden from the start and
+// shown only while the mouse moves (2 s), hidden at once by controller or keyboard input. The
+// in-game menu draws its own cursor. BB_SHOW_CURSOR=1 keeps the system cursor visible.
+struct CursorAutoHide {
+    bool disabled = [] {
+        const char* env = std::getenv("BB_SHOW_CURSOR");
+        return env && env[0] == '1';
+    }();
+    Uint64 last_motion = 0; ///< SDL_GetTicks() of the last mouse movement, 0 = none since input
+    bool visible = true;    ///< what was last applied (SDL shows the cursor at start)
+
+    void OnEvent(const SDL_Event& event) {
+        switch (event.type) {
+        case SDL_EVENT_MOUSE_MOTION:
+        case SDL_EVENT_MOUSE_BUTTON_DOWN:
+        case SDL_EVENT_MOUSE_WHEEL:
+            last_motion = SDL_GetTicks();
+            break;
+        case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+        case SDL_EVENT_KEY_DOWN:
+            last_motion = 0;
+            break;
+        default:
+            break;
+        }
+    }
+
+    void Apply() {
+        constexpr Uint64 ShowMs = 2000;
+        const bool want = disabled || (!BbOverlay::CapturesInput() && last_motion != 0 &&
+                                       SDL_GetTicks() - last_motion < ShowMs);
+        if (want == visible) return;
+        visible = want;
+        if (want) {
+            SDL_ShowCursor();
+        } else {
+            SDL_HideCursor();
+        }
+    }
+};
+CursorAutoHide cursor;
+} // namespace
+
 WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}, height{height_} {
     // Gamepads are sampled by runtime_pad.c; their events are pumped here with the window's.
     if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
@@ -95,6 +139,7 @@ bool WindowSDL::PollEvents() {
     }
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
+        cursor.OnEvent(event);
         if (text_active && (event.type == SDL_EVENT_TEXT_INPUT || event.type == SDL_EVENT_KEY_DOWN)) {
             std::scoped_lock lock{text_mutex};
             if (event.type == SDL_EVENT_TEXT_INPUT) {
@@ -142,6 +187,7 @@ bool WindowSDL::PollEvents() {
             break;
         }
     }
+    cursor.Apply();
     return is_open;
 }
 
