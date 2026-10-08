@@ -73,7 +73,11 @@ public:
     void OnConstants(const float* data);
 
     /// The G-buffer pass (5+ color targets): its depth is the scene depth.
-    void OnGBufferPass(VideoCore::ImageId depth);
+    /// `x_sign`/`y_sign`: signs of the G-buffer pass's viewport x/y scale (window = ndc * scale +
+    /// offset). The motion shader takes ndc as +y down the screen, so the projection's scales are
+    /// multiplied by them: the game's viewport decides which way view +y goes (from the base
+    /// port's 0.4: a fixed sign smeared the background on stairs and when the camera pitched).
+    void OnGBufferPass(VideoCore::ImageId depth, float x_sign = 1.0f, float y_sign = 1.0f);
 
     /// The pass copying the finished frame (`frame`, the last target drawn) to the display: the
     /// frame's depth and camera are complete. Records the debug overlay, starts a new frame.
@@ -105,6 +109,8 @@ private:
     std::array<float, 2> jitter{}, previous_jitter{};
     std::array<u32, 2> render_size{};
     VideoCore::ImageId depth_id{};
+    float gbuffer_x_sign = 1.0f; ///< bbport: G-buffer viewport scale signs (OnGBufferPass)
+    float gbuffer_y_sign = 1.0f;
 
     vk::UniqueDescriptorSetLayout desc_layout;
     vk::UniquePipelineLayout pipeline_layout;

@@ -153,7 +153,7 @@ CameraMotion::CameraMotion(const Instance& instance_, Scheduler& scheduler_,
 CameraMotion::~CameraMotion() = default;
 
 float CameraMotion::VerticalFov() const noexcept {
-    return 2.0f * std::atan(1.0f / current.proj[1]);
+    return 2.0f * std::atan(1.0f / std::abs(current.proj[1]));
 }
 
 float CameraMotion::Near() const noexcept {
@@ -230,7 +230,17 @@ void CameraMotion::OnConstants(const float* data) {
     previous = current;
     std::memcpy(current.view.data(), data + 8, 12 * sizeof(float));
     std::memcpy(current.inv_view.data(), data + 180, 12 * sizeof(float));
-    current.proj = {data[52], data[57], data[62], data[63]};
+    // bbport: the projection as the motion shader uses it, ndc +y down the screen: the scales
+    // take the signs of the frame's G-buffer viewport (BB_CAMERA_Y=up/down forces y, for tests).
+    static const float forced_y = [] {
+        const char* env = std::getenv("BB_CAMERA_Y");
+        return !env ? 0.0f
+               : std::strcmp(env, "up") == 0   ? -1.0f
+               : std::strcmp(env, "down") == 0 ? 1.0f
+                                               : 0.0f;
+    }();
+    const float y_sign = forced_y != 0.0f ? forced_y : gbuffer_y_sign;
+    current.proj = {data[52] * gbuffer_x_sign, data[57] * y_sign, data[62], data[63]};
     current.valid = current.proj[0] != 0.0f && current.proj[1] != 0.0f;
     const std::array<u32, 2> size{u32(data[4]), u32(data[5])};
     if (size != render_size) {
@@ -240,8 +250,10 @@ void CameraMotion::OnConstants(const float* data) {
     frame_has_camera = true;
 }
 
-void CameraMotion::OnGBufferPass(VideoCore::ImageId depth) {
+void CameraMotion::OnGBufferPass(VideoCore::ImageId depth, float x_sign, float y_sign) {
     depth_id = depth;
+    gbuffer_x_sign = x_sign;
+    gbuffer_y_sign = y_sign;
 }
 
 void CameraMotion::OnDisplayPass(VideoCore::ImageId frame) {
