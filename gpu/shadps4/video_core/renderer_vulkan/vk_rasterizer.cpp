@@ -4,6 +4,7 @@
 #include <xxhash.h>
 #include "video_core/renderer_vulkan/ui_composition.h"
 #include "video_core/renderer_vulkan/texture_detail.h"
+#include "video_core/renderer_vulkan/vk_cpu_draw_profile.h"
 #include "bbport_toggles.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
 #include "common/debug.h"
@@ -700,6 +701,7 @@ bool Rasterizer::RunInOrder(OrderedTask task, const void* data, u32 size, u64 to
 
 void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
     auto& self = *static_cast<Rasterizer*>(context);
+    CpuDrawProfile::PacketSample cpu_packet(unsigned(*reinterpret_cast<const PacketKind*>(data)));
     if (*reinterpret_cast<const PacketKind*>(data) == PacketKind::Task) {
         const auto& task = *reinterpret_cast<const TaskPacket*>(data);
         task.task(self, data + sizeof(TaskPacket));
@@ -949,11 +951,17 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* pre
 
 void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw* used_prepared,
                             bool is_indexed, u32 index_offset) {
+    const auto colors = pipeline->GetGraphicsKey().mrt_mask & 0xff;
+    using CpuPhase = CpuDrawProfile::Phase;
+    CpuDrawProfile::Sample cpu_sample(DrawPipe::OnStageB(),
+        std::popcount(colors) >= 5 ? CpuDrawProfile::Kind::Gbuffer :
+        colors == 0 ? CpuDrawProfile::Kind::Depth : CpuDrawProfile::Kind::Other);
     if (DrawPipe::OnStageB()) {
         FrameCapture::Poll();
         scheduler.PopPendingOperations();
     }
     const auto& regs = Regs();
+    cpu_sample.Mark(CpuPhase::Frame);
     // bbport: the pass copying a finished frame to a display buffer; the previous draw's
     // target is that frame.
     if (camera_motion->Enabled() && regs.color_buffers[0] &&
@@ -976,6 +984,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     motion_draw = pipeline->GetGraphicsKey().motion_vectors;
     motion_geometry = 0;
 
+    cpu_sample.Mark(CpuPhase::Targets);
     PrepareRenderState(pipeline);
     if (upscaler->Enabled() && std::popcount(pipeline->GetGraphicsKey().mrt_mask) == 1) {
         const auto& viewport = Regs().viewports[0];
@@ -987,7 +996,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     // bbport: vertex and index buffers are resolved while the helper binds textures (their
     // commands are recorded after BeginRendering, as before).
     draw_inputs = {pipeline, draw_prepared, index_offset, is_indexed, true, false};
+    cpu_sample.Mark(CpuPhase::Resources);
     const bool bound = BindResources(pipeline);
+    cpu_sample.Mark(CpuPhase::Begin);
     bind_prepared = nullptr; // indirect draws and dispatches bind without prepared sharps
     const bool inputs_resolved = draw_inputs.resolved;
     draw_inputs.pending = false;
@@ -996,6 +1007,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     }
     const auto state = BeginRendering(pipeline);
 
+    cpu_sample.Mark(CpuPhase::Inputs);
     if (!inputs_resolved) {
         ResolveVertexBuffers(pipeline, draw_prepared);
         if (is_indexed) {
@@ -1007,10 +1019,12 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         EmitIndexBuffer();
     }
 
+    cpu_sample.Mark(CpuPhase::Barriers);
     if (needs_barrier) {
         runtime.FlushBarriers();
     }
 
+    cpu_sample.Mark(CpuPhase::Motion);
     // bbport: screen-space (clip disabled) draws into the upscaler's output-size images.
     push_data.xscale *= target_scale[0];
     push_data.xoffset *= target_scale[0];
@@ -1115,6 +1129,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             });
         }
     }
+    cpu_sample.Mark(CpuPhase::State);
     pipeline->BindResources(set_writes, push_data);
     // bbport: jitter geometry drawn with the scene depth, not full-screen passes (a shifted
     // full-screen quad leaves an edge column unwritten).
@@ -1127,6 +1142,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     MarkPass(pipeline, state);
     scheduler.BeginRendering(state);
 
+    cpu_sample.Mark(CpuPhase::Record);
     const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
     const auto& fetch_shader = pipeline->GetFetchShader();
     const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
@@ -2079,11 +2095,17 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
 void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* prepared,
                              Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data, u32& write_index) {
+    CpuDrawProfile::Section cpu_section(CpuDrawProfile::Phase::Buffers);
     const u64 alignment = instance.StorageMinAlignment();
     for (u32 buffer_index = 0; buffer_index < stage.buffers.size(); ++buffer_index) {
         const auto& desc = stage.buffers[buffer_index];
-        const RingBinding* ring = num_ring_stages ? FindRingBinding(stage, buffer_index) : nullptr;
+        CpuDrawProfile::Count(CpuDrawProfile::Counter::Bindings);
+        const RingBinding* ring = num_ring_stages
+            ? CpuDrawProfile::Measure<CpuDrawProfile::Phase::RingLookup>(
+                  [&] { return FindRingBinding(stage, buffer_index); })
+            : nullptr;
         if (ring) {
+            CpuDrawProfile::Count(CpuDrawProfile::Counter::Rings);
             // Copied by the GPU command thread into the constant ring (read-only).
             if (!desc.IsSpecial()) {
                 if (ring->size == 864 && gbuffer_draw) {
@@ -2093,6 +2115,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                     const float* live = BbStats::enabled &&
                         memory->IsValidGpuMapping(ring->address, 0)
                         ? reinterpret_cast<const float*>(ring->address) : nullptr;
+                    CpuDrawProfile::Section camera_section(CpuDrawProfile::Phase::Camera);
                     camera_motion->OnConstants(
                         reinterpret_cast<const float*>(constant_ring->Data(ring->offset)), live);
                 }
@@ -2155,6 +2178,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 prepared ? prepared->buffer_sharps[buffer_index] : desc.GetSharp(stage);
             if (vsharp.GetSize() == 864 && gbuffer_draw &&
                 memory->IsValidGpuMapping(vsharp.base_address, 0)) {
+                CpuDrawProfile::Section camera_section(CpuDrawProfile::Phase::Camera);
                 camera_motion->OnConstants(reinterpret_cast<const float*>(vsharp.base_address));
             }
             // Object motion research: the vertex shader buffers of G-buffer draws.
@@ -2178,7 +2202,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
             if (vsharp.base_address == 0 || vsharp.GetSize() == 0) {
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             } else {
-                const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
+                const u64 size = CpuDrawProfile::Measure<CpuDrawProfile::Phase::Clamp>([&] {
+                    return memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
+                });
                 if (size != vsharp.GetSize()) {
                     LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
                               vsharp.GetSize(), size, stage.pgm_hash);
@@ -2198,6 +2224,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                     // Raw storage-buffer writes can also make an aliased cached image stale.
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
                 }
+                CpuDrawProfile::Section access_section(CpuDrawProfile::Phase::Access);
                 needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
             }
         }
@@ -2256,6 +2283,7 @@ Rasterizer::ImageDescCacheEntry& Rasterizer::CachedImageDescEntry(const AmdGpu::
 void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* prepared,
                               Shader::Backend::Bindings& binding, u32& write_index,
                               bool& barrier, bool on_helper) {
+    CpuDrawProfile::Section cpu_section(CpuDrawProfile::Phase::Textures);
     const u32 first_image_idx = image_infos.size();
     TextureSet* set_slot = nullptr;
     if (!on_helper && BindTexturesFromSet(stage, prepared, first_image_idx, barrier, set_slot)) {

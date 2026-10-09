@@ -18,6 +18,7 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "video_core/renderer_vulkan/vk_cpu_draw_profile.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -301,6 +302,8 @@ void PrintBufferStats() {
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer) {
+    namespace Profile = Vulkan::CpuDrawProfile;
+    Profile::Section obtain_section(Profile::Phase::Obtain);
     const bool stats = BufferStatsEnabled();
     if (stats) {
         PrintBufferStats();
@@ -308,6 +311,8 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     }
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size)) {
+        Profile::Section stream_section(Profile::Phase::Stream);
+        Profile::Count(Profile::Counter::Streams);
         if (stats) {
             auto& region = Stats().regions[RegionKey(device_addr)];
             ++region.stream_count;
@@ -336,10 +341,14 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     }
     const u64 first_block = device_addr >> block_shift;
     const u64 last_block = (device_addr + size - 1) >> block_shift;
+    Profile::Count(Profile::Counter::Arenas);
     const auto* arena = GetArena(first_block, last_block);
-    EnsureResident(arena, first_block, last_block);
+    Profile::Measure<Profile::Phase::Residency>(
+        [&] { EnsureResident(arena, first_block, last_block); });
     const u64 uploaded_before = BbStats::buffer_upload_bytes.load(std::memory_order_relaxed);
-    SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
+    Profile::Measure<Profile::Phase::Upload>([&] {
+        return SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
+    });
     if (stats) {
         auto& region = Stats().regions[RegionKey(device_addr)];
         ++region.arena_count;
@@ -551,6 +560,8 @@ const Buffer* BufferCache::UploadCopies(const Buffer* arena, std::span<vk::Buffe
     if (copies.empty()) {
         return nullptr;
     }
+    Vulkan::CpuDrawProfile::Count(Vulkan::CpuDrawProfile::Counter::Uploads);
+    Vulkan::CpuDrawProfile::Count(Vulkan::CpuDrawProfile::Counter::UploadBytes, total_size_bytes);
     BbStats::buffer_upload_bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
     const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
     // bbport: the guest memory is copied into staging on the copy threads, started now in
