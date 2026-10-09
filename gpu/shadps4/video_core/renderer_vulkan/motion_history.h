@@ -40,6 +40,7 @@ VertexRange IndexedRange(std::span<const Index, Extent> indices, int32_t base_ve
 // scene constants (camera), 416-byte model constants and palettes of 3x4 bone matrices
 // (48 bytes per bone). Characters have 656+ bytes; weapons and props 2-8 bones (96-384).
 enum class BufferRole { Other, Skeleton, SmallSkeleton };
+constexpr uint32_t SmallPaletteBytes = 640; ///< SmallSkeleton palettes are smaller
 inline BufferRole ClassifyBuffer(uint32_t size) {
     if (size == 864 || size > 16384) {
         return BufferRole::Other;

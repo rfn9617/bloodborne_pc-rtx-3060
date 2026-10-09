@@ -475,19 +475,28 @@ void Rasterizer::CollectRingBindings(const Shader::Info& stage, const PreparedDr
     }
     const u64 alignment = std::max<u64>(instance.StorageMinAlignment(),
                                         instance.UniformMinAlignment());
-    const auto copy = [&](u32 index, const void* source, VAddr address, u64 size) {
+    const bool vertex = stage.sw_stage == Shader::SwStage::Vertex;
+    const auto copy = [&](u32 index, const void* source, VAddr address, u64 size,
+                          bool palette = false) {
         const auto offset = constant_ring->Allocate(size, alignment);
         if (!offset) {
             return;
         }
         u8* dst = constant_ring->Data(*offset);
+        u64 hash = 0;
         if (source) {
             std::memcpy(dst, source, size);
+        } else if (palette) {
+            // Through cached memory: the hash must not read the ring (write-combined VRAM).
+            alignas(64) u8 local[Motion::SmallPaletteBytes];
+            memory->CopySparseMemory(address, local, size);
+            hash = XXH3_64bits(local, size);
+            std::memcpy(dst, local, size);
         } else {
             memory->CopySparseMemory(address, dst, size);
         }
         constant_ring->Flush(*offset, size);
-        out.push_back({index, static_cast<u32>(size), *offset, address});
+        out.push_back({index, static_cast<u32>(size), *offset, address, hash});
     };
     for (u32 index = 0; index < stage.buffers.size(); ++index) {
         const auto& desc = stage.buffers[index];
@@ -515,7 +524,10 @@ void Rasterizer::CollectRingBindings(const Shader::Info& stage, const PreparedDr
             !CanCaptureGuestBuffer(address, size)) {
             continue;
         }
-        copy(index, nullptr, address, size);
+        const bool palette = vertex && vsharp.GetStride() == 16 &&
+                             size == vsharp.GetSize() &&
+                             Motion::ClassifyBuffer(u32(size)) == Motion::BufferRole::SmallSkeleton;
+        copy(index, nullptr, address, size, palette);
     }
 }
 
@@ -1063,10 +1075,13 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                 memory->IsValidGpuMapping(address, 0) &&
                 memory->ClampRangeSize(address, size) == size) {
                 const RingBinding* captured = num_ring_stages ? FindRingBinding(vs, index) : nullptr;
+                u64 bytes_hash = 0;
                 if (captured && captured->size >= size) {
                     // Match the constants this draw binds, even if the guest reused its RAM.
-                    palette = XXH3_64bits_withSeed(constant_ring->Data(captured->offset), size,
-                                                  palette);
+                    // Stage A hashed them; the ring itself is slow for the CPU to read.
+                    bytes_hash = captured->hash && captured->size == size
+                                     ? captured->hash
+                                     : XXH3_64bits(constant_ring->Data(captured->offset), size);
                 } else if (buffer_cache.IsRegionGpuModified(address, size)) {
                     // Hashing a GPU-written palette through guest RAM causes a readback and
                     // stalls command recording. Keep its history without the static gate;
@@ -1074,9 +1089,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                     gated = false;
                     break;
                 } else {
-                    palette = XXH3_64bits_withSeed(reinterpret_cast<const void*>(address), size,
-                                                  palette);
+                    bytes_hash = XXH3_64bits(reinterpret_cast<const void*>(address), size);
                 }
+                palette = XXH3_64bits_withSeed(&bytes_hash, sizeof(bytes_hash), palette);
             }
         }
         push_data.motion_param = 0;

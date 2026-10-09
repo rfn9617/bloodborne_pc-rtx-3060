@@ -481,6 +481,10 @@ private:
         u32 size;
         u64 offset; ///< in the ring
         VAddr address;
+        /// XXH3 of the bytes, for vertex-stage bone palettes only (else 0): the object motion
+        /// gate compares it with last frame's. Taken at stage A from cached memory; reading the
+        /// ring back on stage B goes through uncached, write-combined VRAM.
+        u64 hash;
     };
     PendingGuestWrites pending_writes;
     u64 proxy_samples = 0; ///< texture bindings that read a scene proxy (statistics)
