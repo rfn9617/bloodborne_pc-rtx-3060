@@ -191,8 +191,11 @@ def main():
             print(f'Output {scaled_output}: live resolution changes (live_resolution=0: startup patch)')
         elif scaled_output:
             env.update(BB_RENDER_RES=scaled_render, BB_OUTPUT_RES=scaled_output, BB_AUTO_RENDER_RES='1')
-            env.setdefault('BB_DMEM_MB', '9152')
-            print(f'Output {scaled_output}: scene {scaled_render}, direct memory {env["BB_DMEM_MB"]} MiB '
+            # Larger guest render targets need more direct memory; a 1080p output does not.
+            if scaled_output != '1920x1080':
+                env.setdefault('BB_DMEM_MB', '9152')
+            memory = f', direct memory {env["BB_DMEM_MB"]} MiB' if env.get('BB_DMEM_MB') else ''
+            print(f'Output {scaled_output}: scene {scaled_render}{memory} '
                   '(live_resolution=1: live changes)')
         run_script('patches.py', '--out', out, '--fps', fps, '--extra', env.get('BB_PATCHES', ''),
                    '--settings', config, '--game-dir', game, '--render-res', env.get('BB_RENDER_RES', ''),

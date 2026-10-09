@@ -130,16 +130,27 @@ def output_size(settings):
 
 
 def scaled_sizes(settings):
-    """(render, output) for an output other than 1080p (above it, or 720p for the Steam Deck):
-    the game renders at output / preset scale (or at the output size without upscaler) and the
-    upscaler fills the output. None at 1080p and for TAA (native, live host targets only)."""
+    """(render, output) when the game itself renders the scene smaller than the output: outputs
+    other than 1080p (above it, or 720p for the Steam Deck), where the game renders at output /
+    preset scale (or at the output size without upscaler), and 1080p with a reduced upscaler
+    preset (bbport). The upscaler fills the output. None for TAA (native, live host targets
+    only), for a native 1080p scene, and at 1080p with BB_1080P_SCENE_PATCH=0.
+
+    At 1080p the alternative is the live path (live_resolution=1): the game draws 1080p frames
+    and the port renders the scene into smaller proxies, resolving them to 1080p wherever the
+    game reads them. The startup patch skips those resolves and runs the game's own 1080p
+    post-processing at the scene size: RTX 3060 Laptop, DLSS Quality, same heavy place,
+    uncapped, 75 -> 84-94 FPS with no visible difference (2026-10-10)."""
     out=output_size(settings)
-    if out==OUTPUT_SIZE or settings.get('upscaler')=='taa': return None
+    if settings.get('upscaler')=='taa': return None
     scale=1.0
     if settings.get('upscaler','fsr3')!='off':
         preset=int(settings.get('preset','0') or 0)
         scale=PRESET_SCALES[max(0,min(preset,len(PRESET_SCALES)-1))]
     render=tuple(max(2,round(v/scale/2)*2) for v in out)
+    if out==OUTPUT_SIZE:
+        if render==OUTPUT_SIZE or os.environ.get('BB_1080P_SCENE_PATCH','1')=='0': return None
+        return render,out
     # A scene of exactly 1920x1080 (4K Performance) is indistinguishable from the game's UI
     # coordinate space, which the port's UI composition recognizes by that size.
     if render==OUTPUT_SIZE: render=(1916,1078)
