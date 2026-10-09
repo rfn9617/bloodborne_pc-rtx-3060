@@ -87,6 +87,10 @@ add_subdirectory(third_party/sirit EXCLUDE_FROM_ALL)
 set(FFX_VK_PORTABLE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(FFX_VK_PORTABLE_BUILD_PROBE OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/fsr-vulkan EXCLUDE_FROM_ALL)
+if (WIN32 AND TARGET ffx_vulkan_fsr3_host_1_1_4)
+    target_compile_options(ffx_vulkan_fsr3_host_1_1_4 PRIVATE
+        -include ${CMAKE_CURRENT_SOURCE_DIR}/shim/ffx_countof_compat.h)
+endif()
 
 # Host shaders -> headers (same scheme as shadPS4's host_shaders/CMakeLists.txt).
 set(SHADER_SRC ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/host_shaders)
