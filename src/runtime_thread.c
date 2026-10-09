@@ -244,6 +244,24 @@ static void set_host_name(const char *name) {
     char host[16]={0};
     memcpy(host,name,strnlen(name,sizeof(host)-1));
     pthread_setname_np(pthread_self(),host);
+#ifdef _WIN32
+    /* The name Windows tools and the CPU sampler (BB_CPU_SAMPLE) show; Windows 10 1607+. */
+    typedef HRESULT (WINAPI *SetDescription)(HANDLE,PCWSTR);
+    static SetDescription set_description;
+    static int looked_up;
+    if (!looked_up) {
+        set_description=(SetDescription)(void (*)(void))GetProcAddress(
+            GetModuleHandleW(L"kernel32.dll"),"SetThreadDescription");
+        looked_up=1;
+    }
+    if (set_description) {
+        wchar_t wide[64];
+        if (MultiByteToWideChar(CP_UTF8,0,name,-1,wide,64)>0) {
+            wide[63]=0;
+            set_description(GetCurrentThread(),wide);
+        }
+    }
+#endif
 }
 #ifdef _WIN32
 #define exit_setjmp(t) bb_setjmp((t)->exit_jump)

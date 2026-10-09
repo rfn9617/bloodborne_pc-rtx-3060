@@ -1,3 +1,4 @@
+#include "bbport_cpu_sampler.h"
 #include "bbport_write_log.h"
 // bbport: glue between the C loader and the vendored shadPS4 video core.
 #include "bbport_overlay.h"
@@ -209,6 +210,7 @@ static void StartProfileWriter() {
 
 extern "C" int bbgpu_init(const BbGpuConfig* config) {
     BbSettings::Load();
+    BbCpuSampler::Start();
 #ifdef BB_PGO_GENERATE
     StartProfileWriter();
 #endif
