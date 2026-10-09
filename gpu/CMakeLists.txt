@@ -10,6 +10,12 @@ if (NOT CMAKE_BUILD_TYPE)
 endif()
 # Frame pointers keep the loader's thread dumps (watchdog, SIGUSR2 sampling) walkable.
 add_compile_options(-fno-omit-frame-pointer)
+if (WIN32)
+    # bbport: standard headers newer libc++ no longer includes transitively (shim/
+    # std_include_compat.h); every C++ file, third-party libraries included.
+    add_compile_options(
+        "$<$<COMPILE_LANGUAGE:CXX>:SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/shim/std_include_compat.h>")
+endif()
 
 # bbport: link-time optimization (BB_LTO, default on) and profile-guided optimization
 # (BB_PGO: off, generate = instrumented build writing into BB_PGO_DIR, use = build with that
@@ -94,7 +100,7 @@ if (WIN32)
         get_target_property(BB_FFX_TYPE ${BB_FFX_TARGET} TYPE)
         if (BB_FFX_TYPE MATCHES "STATIC_LIBRARY|OBJECT_LIBRARY|SHARED_LIBRARY")
             target_compile_options(${BB_FFX_TARGET} PRIVATE
-                -include ${CMAKE_CURRENT_SOURCE_DIR}/shim/ffx_countof_compat.h)
+                "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/shim/ffx_countof_compat.h")
         endif()
     endforeach()
 endif()
