@@ -13,6 +13,8 @@ jobs:
   windows:
     runs-on: windows-2022
     timeout-minutes: 150
+    permissions:
+      contents: write
     defaults:
       run:
         shell: msys2 {0}
@@ -68,3 +70,25 @@ jobs:
           name: bbport-windows
           path: dist/bbport-windows.zip
           retention-days: 30
+
+      # The renderer (bin/ without NVIDIA's DLSS runtime), scripts and run.py as one commit on the
+      # build-output branch: installs on a PC can be updated with git, without the artifact zip.
+      - name: Renderer files to the build-output branch
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          stage=out/stage/bbport-windows
+          out=/tmp/build-output
+          rm -rf "$out"; mkdir -p "$out/bin"
+          for f in "$stage"/bin/*; do
+            [[ $(basename "$f") == nvngx_dlss.dll ]] || cp "$f" "$out/bin/"
+          done
+          cp -r "$stage/scripts" "$out/"; cp "$stage/run.py" "$out/"
+          printf 'commit %s\nrun %s\nbranch %s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_REF_NAME" > "$out/BUILD.txt"
+          cd "$out"
+          git init -q -b build-output
+          git add -A
+          git -c user.name=ci -c user.email=ci@localhost commit -q -m "Build of $GITHUB_SHA (run $GITHUB_RUN_ID)"
+          git push -q -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" build-output

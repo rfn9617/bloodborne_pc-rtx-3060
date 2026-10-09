@@ -83,7 +83,10 @@ private:
     static constexpr u32 FrameSlots = 4;
     static constexpr u32 ParamsPerFrame = 8192;
     // Positions (device local): two halves (current/previous frame) of vec4; element 0 is reserved.
-    static constexpr u32 PositionsPerFrame = 4u << 20;
+    // bbport: 8 Mi vertices (2 x 128 MiB of positions). 4 Mi ran out in heavy places (the
+    // sewers: ~650 draws a frame without their own history, so DLSS saw only camera motion
+    // for them); 8 Mi leaves room on a 6 GB card.
+    static constexpr u32 PositionsPerFrame = 8u << 20;
     Motion::History history{PositionsPerFrame};
     Motion::IndexRangeCache index_ranges;
     std::array<u64, FrameSlots> params_ticks{};
