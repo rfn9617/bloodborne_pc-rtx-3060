@@ -42,7 +42,13 @@ jobs:
 
       - name: Build the port
         run: |
-          if ! bash build.sh; then cat out/gpu-build.log | tail -200; exit 1; fi
+          if ! bash build.sh; then
+            tail -200 out/gpu-build.log || true
+            # The first errors also as annotations (readable without the log archive).
+            { grep -E 'error|FAILED|CMake Error' out/gpu-build.log 2>/dev/null || echo 'no out/gpu-build.log'; } |
+              head -10 | while IFS= read -r line; do echo "::error::${line//%/%25}"; done
+            exit 1
+          fi
 
       - name: NVIDIA DLSS SDK
         run: git clone --depth 1 https://github.com/NVIDIA/DLSS.git /c/dlss-sdk
