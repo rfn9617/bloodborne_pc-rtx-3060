@@ -87,9 +87,16 @@ add_subdirectory(third_party/sirit EXCLUDE_FROM_ALL)
 set(FFX_VK_PORTABLE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(FFX_VK_PORTABLE_BUILD_PROBE OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/fsr-vulkan EXCLUDE_FROM_ALL)
-if (WIN32 AND TARGET ffx_vulkan_fsr3_host_1_1_4)
-    target_compile_options(ffx_vulkan_fsr3_host_1_1_4 PRIVATE
-        -include ${CMAKE_CURRENT_SOURCE_DIR}/shim/ffx_countof_compat.h)
+if (WIN32)
+    # bbport: newer MSYS2 toolchains, see shim/ffx_countof_compat.h.
+    get_property(BB_FFX_TARGETS DIRECTORY third_party/fsr-vulkan PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(BB_FFX_TARGET IN LISTS BB_FFX_TARGETS)
+        get_target_property(BB_FFX_TYPE ${BB_FFX_TARGET} TYPE)
+        if (BB_FFX_TYPE MATCHES "STATIC_LIBRARY|OBJECT_LIBRARY|SHARED_LIBRARY")
+            target_compile_options(${BB_FFX_TARGET} PRIVATE
+                -include ${CMAKE_CURRENT_SOURCE_DIR}/shim/ffx_countof_compat.h)
+        endif()
+    endforeach()
 endif()
 
 # Host shaders -> headers (same scheme as shadPS4's host_shaders/CMakeLists.txt).

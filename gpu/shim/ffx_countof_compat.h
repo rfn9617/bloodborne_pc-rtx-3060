@@ -1,7 +1,8 @@
 // bbport: AMD's FSR 3.1 SDK sources (ffx-1.1.4) use MSVC CRT extensions (_countof,
-// swprintf_s). Recent MSYS2 CLANG64 headers no longer declare them for these strict C++17
-// sources, which broke the Windows CI build (the toolchain installed on 2026-10-08 still
-// does). Forced into that library only. The standard headers come first, so their include
+// swprintf_s) and rely on standard headers other headers used to pull in (<cmath>, <new>).
+// Recent MSYS2 CLANG64 toolchains declare neither for these strict C++17 sources, which
+// broke the Windows CI build (the toolchain installed on 2026-10-08 still builds them).
+// Forced into the SDK's libraries only. The standard headers come first, so their include
 // guards keep later includes from redeclaring the names redirected below.
 #pragma once
 #include <stdarg.h>
@@ -10,9 +11,19 @@
 #include <stdlib.h>
 #include <wchar.h>
 #ifdef __cplusplus
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <cwchar>
+#include <memory>
+#include <new>
+#include <utility>
+#else
+#include <math.h>
+#include <string.h>
 #endif
 
 #ifndef _countof
