@@ -55,7 +55,7 @@ void NoteIntent(std::uint64_t address, const void* data, std::uint64_t size, Sou
 }
 
 void Note(std::uint64_t address, const void* data, std::uint64_t size, Source source) {
-    if (Enabled()) {
+    if (Enabled() || (Mode() == 3 && source == GcImage)) {
         Record(address, data, size, source);
     }
 }
@@ -106,12 +106,12 @@ extern "C" void bbgpu_dump_guest_writes(void* ucontext) {
         std::fprintf(stderr, "Write log: %s=%#llx\n", names[i], (unsigned long long)regs[i]);
     }
     const char* sources[] = {"backing",      "WriteData",           "fence",
-                             "EOP (decoded)", "WriteData (decoded)", "EOS (decoded)"};
+                             "EOP (decoded)", "WriteData (decoded)", "EOS (decoded)", "image GC"};
     const std::uint64_t now = __rdtsc();
     const auto print = [&](const Entry& e, const char* what) {
         std::fprintf(stderr,
                      "Write log: %s %s %#llx +%llu first %#llx tid %u, %.3f s before the fault\n",
-                     what, e.source < 6 ? sources[e.source] : "?", (unsigned long long)e.address,
+                     what, e.source < 7 ? sources[e.source] : "?", (unsigned long long)e.address,
                      (unsigned long long)e.size, (unsigned long long)e.first, e.tid,
                      double(now - e.tsc) / 3.0e9);
     };
@@ -123,7 +123,15 @@ extern "C" void bbgpu_dump_guest_writes(void* ucontext) {
     const std::uint64_t block = regs[0];
     for (std::uint64_t at = block - 0x30; at < block + 0x60; at += 8) {
         std::uint64_t value = 0;
+#ifdef _WIN32
+        // RAX may be a cookie/value after a deliberate guest panic, rather than a pointer.
+        // Do not cause a second access violation while reporting the original crash.
+        SIZE_T read = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(at),
+                               &value, sizeof(value), &read) || read != sizeof(value)) break;
+#else
         std::memcpy(&value, reinterpret_cast<const void*>(at), 8);
+#endif
         std::fprintf(stderr, "Write log: [%#llx] = %#llx\n", (unsigned long long)at,
                      (unsigned long long)value);
     }
@@ -148,6 +156,11 @@ extern "C" void bbgpu_dump_guest_writes(void* ucontext) {
     }
     // Writes that cover the chunk header the guest read (rax..rax+0x40) or the registers.
     const std::uint64_t n = head.load();
+    if (Mode() == 3) {
+        for (std::uint64_t i = n > 32 ? n - 32 : 0; i < n; ++i) {
+            print(ring[i % Size], "recent GC");
+        }
+    }
     int shown = 0;
     for (std::uint64_t i = n; i-- > (n > Size ? n - Size : 0) && shown < 64;) {
         const Entry& e = ring[i % Size];

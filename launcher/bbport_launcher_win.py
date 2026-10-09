@@ -1148,16 +1148,20 @@ class Launcher:
             self.show('game')
             return
         self.set_log('')
+        log = None
         try:
+            log = open_run_log(self.app)
             self.process = subprocess.Popen(run_command(), cwd=PORT_DIR, env=game_environment(self.app),
                                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                             stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
         except OSError as error:
+            if log:
+                log.close()
             self.append(_('Could not start: {}', 'Не удалось запустить: {}').format(error) + '\n')
             self.process = None
             return
         self.job = GameJob(self.process)
-        threading.Thread(target=self.read_output, args=(self.process,), daemon=True).start()
+        threading.Thread(target=self.read_output, args=(self.process, log), daemon=True).start()
         self.play_button.configure(state='disabled')
         self.stop_button.configure(state='normal')
         self.status.configure(text=_('Preparing the game; it opens in its own window…',
@@ -1165,9 +1169,12 @@ class Launcher:
         if self.app.get('close_on_play'):
             self.root.after(5000, self.root.destroy)  # the game keeps running
 
-    def read_output(self, process):
-        for raw in iter(process.stdout.readline, b''):
-            self.output.put(raw.decode('utf-8', errors='replace'))
+    def read_output(self, process, log):
+        with log:
+            for raw in iter(process.stdout.readline, b''):
+                text = raw.decode('utf-8', errors='replace')
+                log.write(text)
+                self.output.put(text)
         self.output.put((process.wait(),))
 
     def drain_output(self):
@@ -1386,13 +1393,20 @@ class GameJob:
             self.handle = None
 
 
+def open_run_log(settings):
+    log_dir = Path(settings.get('user_dir') or DATA_DIR / 'user')
+    log_dir.mkdir(parents=True, exist_ok=True)
+    path = log_dir / 'last_run.log'
+    if path.exists():
+        path.replace(log_dir / 'previous_run.log')
+    return open(path, 'w', encoding='utf-8', buffering=1)
+
+
 def play_without_window(settings):
     """--play: the game with the saved settings (shortcuts, Steam). Output goes to the console
     when there is one and to <saves folder>/last_run.log."""
     attach_stdio()
-    log_dir = Path(settings.get('user_dir') or DATA_DIR / 'user')
-    log_dir.mkdir(parents=True, exist_ok=True)
-    with open(log_dir / 'last_run.log', 'w', encoding='utf-8', buffering=1) as log:
+    with open_run_log(settings) as log:
         process = subprocess.Popen(run_command(), cwd=PORT_DIR, env=game_environment(settings),
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, creationflags=NO_WINDOW)

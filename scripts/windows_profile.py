@@ -22,6 +22,7 @@ APP = {
     'check_updates': False,
 }
 ENVIRONMENT = {'BB_GC_IDLE_SECONDS': '20', 'BB_FPS_LIMIT': '72',
+               'BB_IDLE_MEMORY_GC': '1', 'BB_QUIET_GC': '1',
                'BB_STAGING_KEEP_MB': '1024', 'BB_STAGING_PREWARM_MB': '256'}
 
 

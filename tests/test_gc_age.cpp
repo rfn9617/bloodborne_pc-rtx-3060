@@ -27,5 +27,15 @@ int main() {
     VideoCore::GcAge startup;
     startup.Record(100, 40);
     assert(startup.Before(100, 20) == 0);
+    // Tick zero is also a real first-submission tick. An uninitialised age slot must not
+    // make fresh startup images eligible for below-budget collection.
+    VideoCore::GcAge first_submission;
+    assert(!first_submission.HasHistory(100, 20));
+    first_submission.Record(100, 0);
+    assert(!first_submission.HasHistory(100, 20));
+    assert(!first_submission.HasHistory(119, 20));
+    first_submission.Record(120, 10);
+    assert(first_submission.HasHistory(120, 20) && first_submission.Before(120, 20) == 0);
+    assert(age.HasHistory(201, 60));
     std::puts("Texture GC: loading gaps, long suspension and current-area retention PASS");
 }

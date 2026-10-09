@@ -122,7 +122,17 @@ void ObjectMotion::OnFrameStart() {
         params_ticks[slot] = 0;
     }
     params_used = 0;
-    written = false;
+    read_image = nullptr;
+    for (auto it = images.begin(); it != images.end();) {
+        if (frame - it->second->last_frame > 600) {
+            // A settings/resolution change need not retain unused attachments forever.
+            scheduler.DeferOperation([target = std::move(it->second)] {});
+            it = images.erase(it);
+        } else {
+            it->second->written = false;
+            ++it;
+        }
+    }
     scheduler.EndRendering();
     // Last frame's stores must be visible to this frame's loads. Also finish old reads
     // before the ping-pong half they reference is reused for writes.
@@ -162,16 +172,16 @@ u32 ObjectMotion::PrepareDraw(const DrawInfo& draw) {
     return index;
 }
 
-void ObjectMotion::EnsureImage(u32 width, u32 height) {
-    if (image && width == image_width && height == image_height) {
-        return;
+ObjectMotion::MotionImage& ObjectMotion::EnsureImage(u32 width, u32 height) {
+    auto& target = images[{width, height}];
+    if (target) {
+        target->last_frame = frame;
+        return *target;
     }
+    target = std::make_unique<MotionImage>();
+    target->last_frame = frame;
     const auto device = instance.GetDevice();
-    if (image) {
-        scheduler.Finish();
-    }
-    view.reset();
-    image_layout = vk::ImageLayout::eUndefined;
+    auto& image = target->image;
     image = VideoCore::UniqueImage(device, instance.GetAllocator());
     image.Create(vk::ImageCreateInfo{
         .imageType = vk::ImageType::e2D,
@@ -185,20 +195,22 @@ void ObjectMotion::EnsureImage(u32 width, u32 height) {
                  vk::ImageUsageFlagBits::eTransferSrc,
         .initialLayout = vk::ImageLayout::eUndefined,
     });
-    view = Check(device.createImageViewUnique({
+    target->view = Check(device.createImageViewUnique({
         .image = vk::Image(image),
         .viewType = vk::ImageViewType::e2D,
         .format = vk::Format::eR32G32B32A32Sfloat,
         .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
     }));
-    image_width = width;
-    image_height = height;
-    written = false;
+    return *target;
 }
 
 void ObjectMotion::Attach(RenderState& state, u32 width, u32 height) {
     constexpr u32 slot = Shader::MotionVectors::Output;
-    EnsureImage(width, height);
+    auto& target = EnsureImage(width, height);
+    const auto& image = target.image;
+    const auto& view = target.view;
+    auto& written = target.written;
+    auto& image_layout = target.layout;
     auto& attachment = state.color_attachments[slot];
     attachment = {};
     attachment.image_view = *view;
@@ -231,8 +243,13 @@ void ObjectMotion::Attach(RenderState& state, u32 width, u32 height) {
 
 vk::ImageView ObjectMotion::PrepareRead(vk::CommandBuffer cmdbuf, u32 width, u32 height,
                                         bool& valid) {
-    EnsureImage(std::max(image_width, 1u), std::max(image_height, 1u));
-    valid = written && width == image_width && height == image_height;
+    // A missing size uses a tiny valid descriptor without allocating a full attachment.
+    const auto found = images.find({width, height});
+    auto& target = found != images.end() ? *found->second : EnsureImage(1, 1);
+    read_image = &target;
+    valid = found != images.end() && target.written;
+    const auto& image = target.image;
+    auto& image_layout = target.layout;
     const vk::ImageMemoryBarrier2 barrier{
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
         .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
@@ -245,7 +262,7 @@ vk::ImageView ObjectMotion::PrepareRead(vk::CommandBuffer cmdbuf, u32 width, u32
     };
     cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
     image_layout = vk::ImageLayout::eGeneral;
-    return *view;
+    return *target.view;
 }
 
 } // namespace Vulkan

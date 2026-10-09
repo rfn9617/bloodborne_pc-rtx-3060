@@ -4,6 +4,7 @@
 #include <xxhash.h>
 
 #include "bbport_toggles.h"
+#include "bbport_write_log.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
@@ -17,6 +18,7 @@
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/host_compatibility.h"
+#include "video_core/texture_cache/image_readback.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/texture_cache/tile_manager.h"
 
@@ -71,10 +73,10 @@ void TextureCache::ProcessDownloadImages() {
     download_images.clear();
 }
 
-void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
+bool TextureCache::DownloadImageMemory(ImageId image_id, bool sync, bool for_gc) {
     Image& image = slot_images[image_id];
     if (False(image.flags & ImageFlagBits::GpuModified)) {
-        return;
+        return false;
     }
     const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
                               image.info.resources.layers * (image.info.num_bits / 8);
@@ -100,8 +102,10 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     if (sync) {
         scheduler.Finish();
         download.Invalidate();
-        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
-                                                  download.mapped, download_size);
+        if (for_gc) BbWriteLog::Note(image.info.guest_address, download.mapped, download_size,
+                                     BbWriteLog::GcImage);
+        return Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
+                                                         download.mapped, download_size);
     } else {
         scheduler.DeferPriorityOperation(
             [this, device_addr = image.info.guest_address, download, download_size] {
@@ -111,9 +115,11 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
                 runtime.GetStagingPool().FreeDeferred(download);
             });
     }
+    return true; // Asynchronous download was queued; the GC always uses synchronous writes.
 }
 
 void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
+    image.gc_writeback_safe = false;
     if (image.hash == 0) {
         // Initialize hash
         const u8* addr = std::bit_cast<u8*>(image.info.guest_address);
@@ -982,6 +988,7 @@ void TextureCache::UntrackImageHead(ImageId image_id) {
         return;
     }
     const auto addr = tracker.GetNextPageAddr(image_begin);
+    image.gc_writeback_safe = false;
     const auto size = addr - image_begin;
     image.track_addr = addr;
     if (image.track_addr == image.track_addr_end) {
@@ -1001,6 +1008,7 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
     }
     ASSERT(image.track_addr_end != 0);
     const auto addr = tracker.GetPageAddr(image_end);
+    image.gc_writeback_safe = false;
     const auto size = image_end - addr;
     image.track_addr_end = addr;
     if (image.track_addr == image.track_addr_end) {
@@ -1043,9 +1051,10 @@ void TextureCache::GarbageCollectImages() {
             }
         }
     }
-    if (total_used_memory < trigger_gc_memory) {
-        return;
-    }
+    if (total_used_memory < trigger_gc_memory && !scene_idle) return;
+    // Old CPU-backed area textures can be discarded even below the pressure threshold
+    // after the 3D scene stopped. Keep the established cache policy during gameplay.
+    // Do not retain a departed area indefinitely just because the title menu uses little VRAM.
     // Unused for this long: 20 s normally (BB_GC_IDLE_SECONDS; the textures of an area left
     // behind), 5 s near the budget, 1 s over the critical mark.
     static const u64 idle_seconds = [] {
@@ -1059,39 +1068,72 @@ void TextureCache::GarbageCollectImages() {
     bool pressured = false;
     bool aggresive = false;
     u64 below_tick = 0;
+    bool have_age_history = false;
     size_t num_deletions = 0;
     u32 visited = 0;
 
     const auto configure = [&](bool allow_aggressive) {
         pressured = total_used_memory >= pressure_gc_memory;
         aggresive = allow_aggressive && total_used_memory >= critical_gc_memory;
-        below_tick = tick_seconds_ago(aggresive ? 1 : pressured ? 5 : idle_seconds);
+        const u64 age = aggresive ? 1 : pressured ? 5 : idle_seconds;
+        have_age_history = gc_age.HasHistory(second, age);
+        below_tick = tick_seconds_ago(age);
         num_deletions = aggresive ? 40 : pressured ? 20 : 10;
         visited = 0;
     };
     const auto clean_up = [&](ImageId image_id) {
-        if (num_deletions == 0 || ++visited > 256) {
+        if (!have_age_history || num_deletions == 0 || ++visited > 256) {
             return true;
         }
         auto& image = slot_images[image_id];
         const bool download = image.SafeToDownload();
         const bool tiled = image.info.IsTiled();
-        // bbport (from the base port's 0.3): images that cannot go now (GPU-written: their
-        // contents exist only here; tiled ones cannot be written back at all) neither use up
-        // the deletions nor stay first in line. The oldest ten being such render targets
-        // stopped the collector for good ("0 images evicted") and VRAM grew with every area.
-        if ((tiled && download) || (download && !pressured)) {
+        // Preserve GPU-only data. Tiled color can now go through TileManager's inverse
+        // transfer; unsupported depth/stencil/MSAA layouts remain protected.
+        if (download && !image.SafeForGcWriteback()) {
+            if (!image.gc_unsafe_reported) {
+                image.gc_unsafe_reported = true;
+                ++gc_unsafe_writebacks;
+            }
             lru_cache.Touch(image.lru_id, gc_tick);
             return false;
         }
-        --num_deletions;
+        if ((tiled && download && !CanReadbackColor(image)) ||
+            (download && !pressured && !scene_idle)) {
+            lru_cache.Touch(image.lru_id, gc_tick);
+            return false;
+        }
         if (download) {
             // bbport: synchronously, while the image still protects its pages. A deferred
             // write-back landed after FreeImage had unprotected them, over whatever the game
             // had meanwhile stored there (e.g. its heap after unloading an area).
-            DownloadImageMemory(image_id, true);
+            if (tiled) {
+                // Bound synchronous work during gameplay: at most one tiled image/second.
+                if (gc_tiled_writeback_second == second) return false;
+                gc_tiled_writeback_second = second;
+                // The CPU copy will replace any older sparse-buffer copy of this address.
+                buffer_cache.InvalidateMemory(image.info.guest_address, image.info.guest_size, true);
+                const auto readback = ReadbackColor(runtime, tile_manager, image);
+                scheduler.Finish();
+                readback.Invalidate();
+                BbWriteLog::Note(image.info.guest_address, readback.mapped, image.info.guest_size,
+                                 BbWriteLog::GcImage);
+                if (!Core::Memory::Instance()->TryWriteBacking(
+                        std::bit_cast<u8*>(image.info.guest_address), readback.mapped,
+                        image.info.guest_size)) {
+                    lru_cache.Touch(image.lru_id, gc_tick);
+                    return false; // data could not be preserved: keep the GPU image
+                }
+                ++gc_tiled_downloads;
+            } else {
+                if (!DownloadImageMemory(image_id, true, true)) {
+                    lru_cache.Touch(image.lru_id, gc_tick);
+                    return false;
+                }
+            }
             ++gc_downloads;
         }
+        --num_deletions;
         ++gc_evictions;
         FreeImage(image_id);
         if (total_used_memory < critical_gc_memory) {
@@ -1117,8 +1159,14 @@ void TextureCache::GarbageCollectImages() {
         configure(true);
         lru_cache.ForEachItemBelow(below_tick, clean_up);
     }
-    // bbport: evictions under memory pressure, at most every 5 s (BB_FRAME_STATS or not).
-    if (pressured || gc_downloads != 0 || gc_evictions != 0) {
+    static const bool vram_stats = [] {
+        const char* value = std::getenv("BB_VRAM_STATS");
+        return value && value[0] == '1';
+    }();
+    // Keep ownership reports alive in the title menu even when no more textures are evicted.
+    // Reports remain bounded to every five seconds, without per-frame instrumentation.
+    static const bool quiet_gc = std::getenv("BB_QUIET_GC") != nullptr;
+    if ((pressured || gc_downloads != 0 || gc_evictions != 0 || vram_stats) && !quiet_gc) {
         const auto now = std::chrono::steady_clock::now();
         if (now - gc_report_time >= std::chrono::seconds(5)) {
             std::printf("Texture cache: VRAM %llu of %llu MiB budget (collect from %llu, pressure "
@@ -1130,8 +1178,47 @@ void TextureCache::GarbageCollectImages() {
                         (unsigned long long)(pressure_gc_memory >> 20),
                         (unsigned long long)(critical_gc_memory >> 20),
                         (unsigned long long)gc_evictions, (unsigned long long)gc_downloads);
+            if (BbStats::enabled || vram_stats) {
+                // Driver usage includes DLSS/driver allocations as well as this allocator.
+                // Count retired images too: they stay alive until their submission completes.
+                const auto owned = instance.GetDeviceAllocationStats();
+                u64 images = 0, bytes = 0, gpu_tiled = 0, gpu_linear = 0, retired = 0;
+                for (const auto& image : slot_images) {
+                    u64 image_bytes = 0;
+                    for (const auto& backing : image.backing_images) {
+                        image_bytes += backing.image.size_bytes;
+                    }
+                    ++images;
+                    bytes += image_bytes;
+                    if (False(image.flags & ImageFlagBits::Registered)) retired += image_bytes;
+                    else if (image.SafeToDownload()) {
+                        if (image.info.IsTiled()) gpu_tiled += image_bytes;
+                        else gpu_linear += image_bytes;
+                    }
+                }
+                std::printf("VRAM ownership: VMA live %llu MiB / reserved %llu MiB, %llu "
+                            "allocations / %llu blocks; texture images %llu / %llu MiB "
+                            "(GPU-only tiled %llu, linear %llu, retired %llu MiB); sparse buffers "
+                            "%llu MiB\n",
+                            (unsigned long long)(owned.live_bytes >> 20),
+                            (unsigned long long)(owned.block_bytes >> 20),
+                            (unsigned long long)owned.allocations, (unsigned long long)owned.blocks,
+                            (unsigned long long)images, (unsigned long long)(bytes >> 20),
+                            (unsigned long long)(gpu_tiled >> 20),
+                            (unsigned long long)(gpu_linear >> 20),
+                            (unsigned long long)(retired >> 20),
+                            (unsigned long long)(buffer_cache.ResidentBytes() >> 20));
+                std::printf("Texture cache: %llu tiled color images preserved in RAM and "
+                            "evicted since the last report\n",
+                            (unsigned long long)gc_tiled_downloads);
+                std::printf("Texture cache: pressure writeback refused for %llu images with "
+                            "lost guest page tracking since the last report\n",
+                            (unsigned long long)gc_unsafe_writebacks);
+            }
             gc_report_time = now;
             gc_evictions = gc_downloads = 0;
+            gc_tiled_downloads = 0;
+            gc_unsafe_writebacks = 0;
         }
     }
 }

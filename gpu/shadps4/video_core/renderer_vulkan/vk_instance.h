@@ -485,6 +485,13 @@ public:
     /// (VK_EXT_memory_budget: what this process can use now, other processes included).
     [[nodiscard]] u64 GetDeviceMemoryBudgetNow() const;
 
+    struct DeviceAllocationStats {
+        u64 live_bytes = 0, block_bytes = 0;
+        u64 allocations = 0, blocks = 0;
+    };
+    /// VMA-owned allocations on the same device-local heaps as the driver budget report.
+    [[nodiscard]] DeviceAllocationStats GetDeviceAllocationStats() const;
+
     /// Returns the total memory budget available to the device.
     [[nodiscard]] u64 GetTotalMemoryBudget() const {
         return total_memory_budget;

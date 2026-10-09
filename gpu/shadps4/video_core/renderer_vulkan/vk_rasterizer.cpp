@@ -272,8 +272,8 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     gbuffer_draw = camera_motion->Enabled() && std::popcount(key.mrt_mask) >= 5 && db_desc.first;
     if (gbuffer_draw) {
         const auto& vp = regs.viewports[0];
-        camera_motion->OnGBufferPass(db_desc.first, vp.xscale < 0.0f ? -1.0f : 1.0f,
-                                     vp.yscale < 0.0f ? -1.0f : 1.0f);
+        gbuffer_draw = camera_motion->OnGBufferPass(db_desc.first, vp.xscale < 0.0f ? -1.0f : 1.0f,
+                                                   vp.yscale < 0.0f ? -1.0f : 1.0f);
     }
     if (upscaler->Enabled() && cb_descs[0].first) {
         upscaler->OnColorTarget(cb_descs[0].first);
@@ -449,47 +449,14 @@ void Rasterizer::NotePendingGpuWrite(VAddr address, u64 size) {
     if (!draw_pipe || !size) {
         return;
     }
-    // Draws write the same buffers over and over: an entry for the range only moves on.
-    const u64 position = draw_pipe->Head();
-    const VAddr end = address + size;
-    for (auto& write : pending_writes) {
-        if (address <= write.end && write.begin <= end) {
-            write.begin = std::min(write.begin, address);
-            write.end = std::max(write.end, end);
-            write.position = position;
-            pending_min = std::min(pending_min, address);
-            pending_max = std::max(pending_max, end);
-            return;
-        }
-    }
-    pending_writes.push_back({address, end, position});
-    pending_min = std::min(pending_min, address);
-    pending_max = std::max(pending_max, end);
+    // Ordered memory tasks have already been committed when this is called.
+    pending_writes.Note(address, size, draw_pipe->Head());
 }
 
-bool Rasterizer::PendingWriteOverlaps(VAddr address, u64 size) {
-    if (pending_writes.empty() || address >= pending_max || address + size <= pending_min) {
-        return false;
-    }
-    // Now and then drop entries whose writes the recording thread has done: the bounds shrink.
-    if ((++pending_checks & 63) == 0) {
-        std::erase_if(pending_writes, [&](const PendingWrite& write) {
-            return draw_pipe->Reached(write.position);
-        });
-        pending_min = ~VAddr{0};
-        pending_max = 0;
-        for (const auto& write : pending_writes) {
-            pending_min = std::min(pending_min, write.begin);
-            pending_max = std::max(pending_max, write.end);
-        }
-    }
-    const VAddr end = address + size;
-    for (const auto& write : pending_writes) {
-        if (address < write.end && write.begin < end && !draw_pipe->Reached(write.position)) {
-            return true;
-        }
-    }
-    return false;
+bool Rasterizer::CanCaptureGuestBuffer(VAddr address, u64 size) {
+    return pending_writes.CanSnapshot(
+        address, size, [&](u64 position) { return draw_pipe->Reached(position); },
+        [&] { return buffer_cache.IsRegionGpuModified(address, size); });
 }
 
 void Rasterizer::CollectRingBindings(const Shader::Info& stage, const PreparedDraw* prepared,
@@ -539,13 +506,12 @@ void Rasterizer::CollectRingBindings(const Shader::Info& stage, const PreparedDr
         }
         const u64 size = memory->ClampRangeSize(address, vsharp.GetSize());
         if (desc.is_written) {
-            NotePendingGpuWrite(address, size);
             continue;
         }
         // The stream path of BufferCache::ObtainBuffer, taken here: small, read-only, not
         // written by the GPU (now or by work still queued for the recording thread).
         if (size == 0 || size > VideoCore::BufferCache::STREAM_THRESHOLD ||
-            buffer_cache.IsRegionGpuModified(address, size) || PendingWriteOverlaps(address, size)) {
+            !CanCaptureGuestBuffer(address, size)) {
             continue;
         }
         copy(index, nullptr, address, size);
@@ -580,6 +546,32 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
 #endif
     const auto stages =
         pipeline ? pipeline->GetStages() : std::span<const Shader::Info* const>{};
+    // Register every writer before capturing any stage's readers. Until Commit(), the
+    // position of this packet is unknown (Begin() can wrap the ring); it cannot retire.
+    for (const auto* stage : stages) {
+        if (!stage) continue;
+        const PreparedStage* ready = nullptr;
+        if (used_prepared && !BbToggle::Disabled(BbToggle::PreparedResources)) {
+            for (u32 i = 0; i < used_prepared->num_stages; ++i) {
+                const auto& candidate = used_prepared->stages[i];
+                if (&candidate.program->info == stage &&
+                    candidate.num_buffers == stage->buffers.size()) {
+                    ready = &candidate;
+                    break;
+                }
+            }
+        }
+        for (u32 index = 0; index < stage->buffers.size(); ++index) {
+            const auto& desc = stage->buffers[index];
+            if (desc.IsSpecial() || !desc.is_written) continue;
+            const auto sharp = ready ? ready->buffer_sharps[index] : desc.GetSharp(*stage);
+            if (sharp.base_address && sharp.GetSize()) {
+                pending_writes.Note(sharp.base_address,
+                                    memory->ClampRangeSize(sharp.base_address, sharp.GetSize()),
+                                    PendingGuestWrites::Unpublished);
+            }
+        }
+    }
     // Constants: copied here into the ring, the recording thread only binds them.
     thread_local std::array<boost::container::static_vector<RingBinding, Shader::NUM_BUFFERS>,
                             Shader::MaxStageTypes>
@@ -676,6 +668,7 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
     }
     dirty.Clear();
     draw_pipe->Commit(static_cast<u32>(out - start));
+    pending_writes.Publish(draw_pipe->Head());
     PrintPipeStats();
 }
 
@@ -966,6 +959,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     if (camera_motion->Enabled() && regs.color_buffers[0] &&
         FrameCapture::IsDisplayBuffer(regs.color_buffers[0].Address())) {
         scene_started = false;
+        if (camera_motion->HasFrameCamera()) last_scene_frame = std::chrono::steady_clock::now();
         camera_motion->OnDisplayPass(cb_descs[0].first);
         if (upscaler->OnFrameStart()) {
             object_motion->InvalidateHistory();
@@ -1039,7 +1033,8 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         }();
         bool gated = !all_motion;
         u64 palette = 0;
-        for (const auto& resource : vs.buffers) {
+        for (u32 index = 0; index < vs.buffers.size(); ++index) {
+            const auto& resource = vs.buffers[index];
             if (resource.IsSpecial()) continue;
             const auto buffer = resource.GetSharp(vs);
             const u32 size = buffer.GetSize();
@@ -1053,8 +1048,21 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             if (role == Motion::BufferRole::SmallSkeleton &&
                 memory->IsValidGpuMapping(address, 0) &&
                 memory->ClampRangeSize(address, size) == size) {
-                palette = XXH3_64bits_withSeed(reinterpret_cast<const void*>(address), size,
-                                               palette);
+                const RingBinding* captured = num_ring_stages ? FindRingBinding(vs, index) : nullptr;
+                if (captured && captured->size >= size) {
+                    // Match the constants this draw binds, even if the guest reused its RAM.
+                    palette = XXH3_64bits_withSeed(constant_ring->Data(captured->offset), size,
+                                                  palette);
+                } else if (buffer_cache.IsRegionGpuModified(address, size)) {
+                    // Hashing a GPU-written palette through guest RAM causes a readback and
+                    // stalls command recording. Keep its history without the static gate;
+                    // the vertex shader already consumes the correct GPU buffer.
+                    gated = false;
+                    break;
+                } else {
+                    palette = XXH3_64bits_withSeed(reinterpret_cast<const void*>(address), size,
+                                                  palette);
+                }
             }
         }
         push_data.motion_param = 0;
@@ -1071,7 +1079,10 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                 range = {};
                 const u64 bytes = u64(regs.num_indices) * index_size;
                 if (index_address && memory->IsValidGpuMapping(index_address, 0) &&
-                    memory->ClampRangeSize(index_address, bytes) == bytes) {
+                    memory->ClampRangeSize(index_address, bytes) == bytes &&
+                    !buffer_cache.IsRegionGpuModified(index_address, bytes)) {
+                    // Motion history must not force a CPU download of GPU-generated indices.
+                    // A zero range skips history for this draw; static character indices retain it.
                     const bool restart = regs.enable_primitive_restart != 0;
                     const u32 count = regs.num_indices;
                     const auto scanned = object_motion->IndexRange(
@@ -1413,6 +1424,17 @@ void Rasterizer::OnSubmit() {
         buffer_cache.ProcessFaultBuffer();
     }
     texture_cache.ProcessDownloadImages();
+    const auto now = std::chrono::steady_clock::now();
+    static const bool idle_memory_gc = [] {
+        const char* value = std::getenv("BB_IDLE_MEMORY_GC");
+        return value && value[0] == '1';
+    }();
+    const bool scene_idle = idle_memory_gc && now - last_scene_frame >= std::chrono::seconds(30);
+    texture_cache.SetSceneIdle(scene_idle);
+    if (idle_memory_gc) {
+        buffer_cache.CollectIdleMemory(u64(std::chrono::duration_cast<std::chrono::seconds>(
+            now.time_since_epoch()).count()), scene_idle);
+    }
     texture_cache.RunGarbageCollector();
     const auto generation = texture_cache.RegistryGeneration();
     if (generation != scene_collection_generation) {
@@ -2064,9 +2086,15 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
         if (ring) {
             // Copied by the GPU command thread into the constant ring (read-only).
             if (!desc.IsSpecial()) {
-                if (ring->size == 864 && gbuffer_draw &&
-                    memory->IsValidGpuMapping(ring->address, 0)) {
-                    camera_motion->OnConstants(reinterpret_cast<const float*>(ring->address));
+                if (ring->size == 864 && gbuffer_draw) {
+                    // Stage A captured these bytes for the draw. The guest may already have
+                    // reused its original buffer while stage B waits to record this frame.
+                    // Motion reconstruction must use the camera that actually drew the scene.
+                    const float* live = BbStats::enabled &&
+                        memory->IsValidGpuMapping(ring->address, 0)
+                        ? reinterpret_cast<const float*>(ring->address) : nullptr;
+                    camera_motion->OnConstants(
+                        reinterpret_cast<const float*>(constant_ring->Data(ring->offset)), live);
                 }
                 push_data.AddOffset(binding.buffer, 0);
             }
@@ -3187,6 +3215,7 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     DrainDrawPipe();
     buffer_cache.InvalidateMemory(addr, size);
     texture_cache.UnmapMemory(addr, size);
+    buffer_cache.ReleaseUnmappedMemory(addr, size);
     {
         std::scoped_lock lock{mapped_ranges_mutex};
         mapped_ranges -= decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
@@ -3552,7 +3581,7 @@ namespace Vulkan {
 
 void Rasterizer::MarkPass(const GraphicsPipeline* pipeline, const RenderState& state) {
     auto* profiler = GpuProfiler::Get();
-    if (!profiler || !scheduler.WillBeginRendering(state)) {
+    if (!profiler || !profiler->IsSampling() || !scheduler.WillBeginRendering(state)) {
         return;
     }
     const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);

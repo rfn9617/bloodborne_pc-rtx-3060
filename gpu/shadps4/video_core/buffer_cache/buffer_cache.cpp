@@ -172,7 +172,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     }
 }
 
-void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
+bool BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
     boost::container::small_vector<vk::BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
     const VAddr arena_base = arena->cpu_addr;
@@ -191,10 +191,9 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
             total_size_bytes += (new_size + align - 1) & mask;
         };
         gpu_modified_ranges.ForEachInRange(address, size, add_download);
-        gpu_modified_ranges.Subtract(address, size);
     });
     if (total_size_bytes == 0) {
-        return;
+        return true;
     }
     const auto download = staging_pool.Request(total_size_bytes, VideoCore::MemoryType::HostCached);
     for (auto& copy : copies) {
@@ -204,16 +203,22 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     scheduler.Finish();
 
     download.buffer->Invalidate(download.offset, download.size);
+    bool success = true;
     for (const auto& copy : copies) {
         auto* dst_addr = std::bit_cast<u8*>(arena_base + copy.srcOffset);
-        memory->TryWriteBacking(dst_addr, download.mapped + (copy.dstOffset - download.offset),
-                                copy.size);
+        if (memory->TryWriteBacking(dst_addr, download.mapped + (copy.dstOffset - download.offset),
+                                   copy.size)) {
+            gpu_modified_ranges.Subtract(arena_base + copy.srcOffset, copy.size);
+        } else {
+            success = false;
+        }
     }
-    memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
+    if (success) memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
+    return success;
 }
 
 namespace {
-// bbport: BB_BUFFER_STATS=1 — how buffer bindings reach the GPU, by guest region (256 MiB),
+// bbport: BB_BUFFER_STATS=1 вЂ” how buffer bindings reach the GPU, by guest region (256 MiB),
 // printed every 5 s: small read-only copies into the stream buffer, arena bindings, and the
 // bytes those re-upload after CPU writes. Input for engine-level short paths.
 struct BufferStats {
@@ -393,6 +398,7 @@ void BufferCache::ProcessFaultBuffer() {
 }
 
 void BufferCache::SynchronizeDmaBuffers() {
+    last_dma_tick = scheduler.CurrentTick();
     for (const auto& range : resident_ranges) {
         const u64 page = range.start >> (arena_page_bits - block_shift);
         const VAddr device_addr = range.start << block_shift;
@@ -440,7 +446,7 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
             .resourceOffset = (start - base_block) << block_shift,
             .size = (end - start) << block_shift,
             .memory = backing.memory,
-            .memoryOffset = backing.offset + ((start - backing.start) << block_shift),
+            .memoryOffset = (backing.offset + start - backing.start) << block_shift,
         });
     });
 
@@ -456,6 +462,9 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
 }
 
 void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
+    resident_ranges.ForEachInRange(first_block, last_block + 1, [&](const Backing& backing) {
+        sparse_allocations.at(backing.memory).last_use = scheduler.CurrentTick();
+    });
     u32 resident_blocks{};
     IntervalList bind_ranges;
     resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64 start, u64 end) {
@@ -473,6 +482,9 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         .memoryTypeIndex = arena_memory_type_index,
     };
     const auto device_memory = Vulkan::Check(instance.GetDevice().allocateMemory(alloc_info));
+    resident_bytes += alloc_info.allocationSize;
+    sparse_allocations.emplace(device_memory, SparseAllocation{alloc_info.allocationSize,
+                                                               scheduler.CurrentTick()});
 
     boost::container::small_vector<vk::BufferCopy, 8> copies;
     const auto staging =
@@ -487,7 +499,7 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         backing.start = range.start;
         backing.end = range.end;
         backing.memory = device_memory;
-        backing.offset = memory_offset;
+        backing.offset = memory_offset >> block_shift;
         resident_ranges.Add(backing);
 
         LOG_INFO(Render, "Making range start={}, end={} resident", backing.start, backing.end);
@@ -671,6 +683,110 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
     auto& tile_manager = texture_cache.GetTileManager();
     tile_manager.TileImage(image, buffer_copies, arena, arena_offset);
     return true;
+}
+
+void BufferCache::ReleaseUnmappedMemory(VAddr address, u64 size, bool assume_gpu_thread) {
+    if (size == 0 || address > std::numeric_limits<u64>::max() - size) return;
+    const auto release = [this, address, size] {
+        // Keep edge pages shared with still-mapped guest memory.
+        const u64 first = Common::AlignUp(address, u64(block_size)) >> block_shift;
+        const u64 end = (address + size) >> block_shift;
+        if (!resident_ranges.Overlaps(first, end)) return;
+        // Sparse binds run outside the command buffer: finish earlier users before unbinding.
+        scheduler.Finish();
+        resident_ranges.ForEachInRange(first, end, [&](const Backing& backing) {
+            const u64 begin = std::max(first, backing.start);
+            const u64 stop = std::min(end, backing.end);
+            const VAddr base = begin << block_shift;
+            const u64 bytes = (stop - begin) << block_shift;
+            // Old arenas created by migration can still alias the same physical memory.
+            for (const auto& arena : arenas) {
+                const VAddr a = std::max(base, arena.cpu_addr);
+                const VAddr b = std::min(base + bytes, arena.cpu_addr + arena.size_bytes);
+                if (a >= b) continue;
+                BindsForArena(&arena)->binds.push_back(vk::SparseMemoryBind{
+                    .resourceOffset = a - arena.cpu_addr, .size = b - a,
+                    .memory = VK_NULL_HANDLE, .memoryOffset = 0,
+                });
+            }
+            runtime.FillBuffer(bda_pagetable_buffer.get(), begin * sizeof(vk::DeviceAddress),
+                               (stop - begin) * sizeof(vk::DeviceAddress), 0);
+            gpu_modified_ranges.Subtract(base, bytes);
+            memory_tracker->UnmarkRegionAsGpuModified(base, bytes);
+            memory_tracker->MarkRegionAsCpuModified(base, bytes);
+        });
+        resident_ranges.Subtract(first, end);
+        // One allocation can back several disjoint intervals. Free only after its last range.
+        u64 retired_bytes = 0;
+        for (auto it = sparse_allocations.begin(); it != sparse_allocations.end();) {
+            const bool referenced = std::ranges::any_of(resident_ranges,
+                [&](const Backing& backing) { return backing.memory == it->first; });
+            if (referenced) { ++it; continue; }
+            const auto device = instance.GetDevice();
+            const auto allocation = it->first;
+            scheduler.DeferOperation([device, allocation] { device.freeMemory(allocation); });
+            retired_bytes += it->second.bytes;
+            it = sparse_allocations.erase(it);
+        }
+        // Submit null binds and page-table clearing before deferred physical frees run.
+        scheduler.Finish();
+        scheduler.PopPendingOperations();
+        resident_bytes -= retired_bytes;
+        if (retired_bytes && !std::getenv("BB_QUIET_GC")) std::printf("Sparse cache: released %llu MiB after guest unmap/idle retirement; %llu MiB remain\n",
+            (unsigned long long)(retired_bytes >> 20), (unsigned long long)(resident_bytes >> 20));
+    };
+    if (assume_gpu_thread) release();
+    else liverpool->SendCommand<true>(release);
+}
+
+void BufferCache::CollectIdleMemory(u64 second, bool scene_idle) {
+    residency_age.Record(second, scheduler.CurrentTick());
+    if (!scene_idle || last_residency_gc == second ||
+        !residency_age.HasHistory(second, 30) || sparse_allocations.empty()) return;
+    last_residency_gc = second;
+    const u64 cutoff = residency_age.Before(second, 30);
+    // Dynamic BDA accesses are not individually bound. Do not retire any pages while
+    // indirect shaders may still be reading them; ordinary bindings update last_use.
+    if (last_dma_tick > cutoff || last_dma_tick == scheduler.CurrentTick()) return;
+    const auto candidates = std::min<size_t>(sparse_allocations.size(), 32);
+    for (size_t n = 0; n < candidates; ++n) {
+        auto allocation = sparse_allocations.upper_bound(residency_gc_cursor);
+        if (allocation == sparse_allocations.end()) allocation = sparse_allocations.begin();
+        const auto handle = allocation->first;
+        residency_gc_cursor = handle;
+        if (allocation->second.last_use > cutoff ||
+            allocation->second.last_use >= scheduler.CurrentTick() ||
+            allocation->second.bytes > 64_MB) continue;
+        std::vector<std::pair<VAddr, u64>> ranges;
+        bool safe = true;
+        for (const auto& backing : resident_ranges) {
+            if (backing.memory != handle) continue;
+            const VAddr address = backing.start << block_shift;
+            const u64 size = (backing.end - backing.start) << block_shift;
+            // A simultaneous CPU-dirty flag makes ownership ambiguous. Keep that allocation.
+            if (IsRegionGpuModified(address, size) && IsRegionCpuModified(address, size)) {
+                safe = false;
+                break;
+            }
+            ranges.emplace_back(address, size);
+        }
+        if (!safe || ranges.empty() || ranges.size() > 16) continue;
+        scheduler.Wait(allocation->second.last_use);
+        for (const auto& [address, size] : ranges) {
+            const auto* arena = GetArena(address >> block_shift,
+                                         (address + size - 1) >> block_shift);
+            if (!DownloadMemory(arena, address, size) ||
+                IsRegionGpuModified(address, size) || gpu_modified_ranges.Intersects(address, size)) {
+                safe = false;
+                break;
+            }
+        }
+        if (!safe) continue; // failed preservation must leave GPU memory and dirty tracking intact
+        // Full allocation retirement avoids leaving mostly-unused shared physical blocks.
+        // RAM is now authoritative; a later explicit binding uploads its current contents.
+        for (const auto& [address, size] : ranges) ReleaseUnmappedMemory(address, size, true);
+        return; // at most one allocation per second, only after a sustained absence of 3D
+    }
 }
 
 void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {

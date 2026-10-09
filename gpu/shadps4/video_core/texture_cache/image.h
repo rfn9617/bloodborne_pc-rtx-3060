@@ -116,6 +116,11 @@ struct Image {
         return True(flags & ImageFlagBits::GpuModified) && False(flags & (ImageFlagBits::Dirty));
     }
 
+    bool SafeForGcWriteback() const {
+        return gc_writeback_safe && info.guest_size != 0 && track_addr == info.guest_address &&
+               track_addr_end == info.guest_address + info.guest_size;
+    }
+
     void AssociateDepth(ImageId depth_image_id, u64 depth_image_uid) {
         depth_id = depth_image_id;
         depth_uid = depth_image_uid;
@@ -152,6 +157,10 @@ public:
         u32 vo_surface : 1;
     } usage{};
     bool scene_proxy = false; ///< bbport: SceneTargets holds a reduced-size proxy of it
+    // A writable edge page can be reused without another image fault. Re-protecting it later
+    // does not prove that its original CPU data survived: never pressure-write it into RAM.
+    bool gc_writeback_safe = true;
+    bool gc_unsafe_reported = false;
     VAddr track_addr = 0;
     VAddr track_addr_end = 0;
     VAddr guest_begin = 0; ///< info.guest_address

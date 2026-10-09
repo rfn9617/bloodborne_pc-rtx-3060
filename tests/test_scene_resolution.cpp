@@ -4,6 +4,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#ifdef _WIN32
+#define NDEBUG // match the renderer's Vulkan-Hpp dispatcher layout
+#endif
 #include "common/slot_vector.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -11,6 +14,10 @@
 #include "video_core/renderer_vulkan/vk_scene_resolution.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include <vk_mem_alloc.h>
+#ifdef _WIN32
+#undef NDEBUG
+#include <cassert>
+#endif
 
 int main() {
     using namespace Vulkan;
@@ -118,6 +125,13 @@ int main() {
         assert(std::bit_cast<float>(depth_bits)==0.25f);
         assert((pixel(d.image,vk::ImageAspectFlagBits::eStencil,d.layout,size.width,size.height)&255)==copied_stencil);
 
+        // Native surfaces still contain the earlier frame. Keep them readable for direct
+        // inspection without invoking NativeAccess (which would resolve the proxies).
+        runtime.Transit(&images[color_id],vk::ImageLayout::eTransferSrcOptimal,
+            vk::PipelineStageFlagBits2::eTransfer,vk::AccessFlagBits2::eTransferRead);
+        runtime.Transit(&images[depth_id],vk::ImageLayout::eTransferSrcOptimal,
+            vk::PipelineStageFlagBits2::eTransfer,vk::AccessFlagBits2::eTransferRead);
+        runtime.FlushBarriers();
         c = targets.Attachment(color_id,cv);
         d = targets.Attachment(depth_id,dv);
         auto cmd = scheduler.CommandBuffer();
@@ -131,6 +145,22 @@ int main() {
             .colorAttachmentCount=1,.pColorAttachments=&color,
             .pDepthAttachment=&depth,.pStencilAttachment=&depth}, dispatch);
         cmd.endRendering(dispatch);
+        // The upscaler's proxy inputs contain current color/depth/stencil, without eagerly
+        // touching the full-resolution images. Later native consumers must still receive
+        // the current values, tested by the existing resolve checks immediately below.
+        c = targets.Read(color_id,cv,vk::PipelineStageFlagBits2::eTransfer,
+                         vk::AccessFlagBits2::eTransferRead);
+        d = targets.Read(depth_id,dv,vk::PipelineStageFlagBits2::eTransfer,
+                         vk::AccessFlagBits2::eTransferRead);
+        assert(pixel(c.image,vk::ImageAspectFlagBits::eColor,c.layout,size.width,size.height)==0xff0000ff);
+        assert(std::bit_cast<float>(pixel(d.image,vk::ImageAspectFlagBits::eDepth,d.layout,size.width,size.height))==0.75f);
+        assert((pixel(d.image,vk::ImageAspectFlagBits::eStencil,d.layout,size.width,size.height)&255)==resolved_stencil);
+        assert(pixel(images[color_id].GetImage(),vk::ImageAspectFlagBits::eColor,
+                     vk::ImageLayout::eTransferSrcOptimal,1920,1080)==0xffff0000);
+        assert(std::bit_cast<float>(pixel(images[depth_id].GetImage(),vk::ImageAspectFlagBits::eDepth,
+                     vk::ImageLayout::eTransferSrcOptimal,1920,1080))==0.25f);
+        assert((pixel(images[depth_id].GetImage(),vk::ImageAspectFlagBits::eStencil,
+                     vk::ImageLayout::eTransferSrcOptimal,1920,1080)&255)==copied_stencil);
         runtime.Transit(&images[color_id],vk::ImageLayout::eTransferSrcOptimal,
             vk::PipelineStageFlagBits2::eTransfer,vk::AccessFlagBits2::eTransferRead);
         runtime.FlushBarriers();

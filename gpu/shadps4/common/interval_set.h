@@ -85,6 +85,19 @@ public:
         Coalesce(at, m);
     }
 
+    /// Removes a range while preserving both residual intervals and their backing offsets.
+    void Subtract(u64 start, u64 end) {
+        if (start >= end) return;
+        auto [first, last] = OverlapRun(start, end);
+        if (first == last) return;
+        IV out[2];
+        std::size_t count = 0;
+        if (first->start < start) out[count++] = first->SubRange(first->start, start);
+        const auto tail = std::prev(last);
+        if (tail->end > end) out[count++] = tail->SubRange(end, tail->end);
+        Splice(first, last, out, count);
+    }
+
     /// Returns immutable iterator to an interval that contains provided address.
     const_iterator Find(u64 addr) const {
         auto it = std::ranges::upper_bound(intervals, addr, {}, &IV::start);
@@ -173,7 +186,7 @@ protected:
             intervals.insert(first, src, src + m);
             return;
         }
-        const auto slots = std::distance(first, last);
+        const auto slots = static_cast<std::size_t>(std::distance(first, last));
         if (m <= slots) {
             std::copy(src, src + m, first);
             if (m < slots) {

@@ -214,13 +214,22 @@ if (WIN32)
 endif()
 
 # Explicit test targets; neither launches the game nor needs a Vulkan device.
-foreach(BB_CPU_TEST IN ITEMS texture_detail gc_age staging_policy)
+foreach(BB_CPU_TEST IN ITEMS texture_detail gc_age staging_policy sparse_residency)
     string(REPLACE "_" "-" BB_CPU_TARGET "${BB_CPU_TEST}")
     add_executable(${BB_CPU_TARGET}-test EXCLUDE_FROM_ALL ../tests/test_${BB_CPU_TEST}.cpp)
     target_compile_options(${BB_CPU_TARGET}-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
     target_include_directories(${BB_CPU_TARGET}-test PRIVATE .. shadps4)
 endforeach()
 add_executable(motion-history-test EXCLUDE_FROM_ALL ../tests/test_motion_history.cpp)
+add_executable(pending-guest-writes-test EXCLUDE_FROM_ALL ../tests/test_pending_guest_writes.cpp)
+target_compile_options(pending-guest-writes-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(pending-guest-writes-test PRIVATE shadps4)
+add_executable(frame-camera-selection-test EXCLUDE_FROM_ALL ../tests/test_frame_camera_selection.cpp)
+add_executable(vertex-fetch-prefix-test EXCLUDE_FROM_ALL ../tests/test_vertex_fetch_prefix.cpp)
+target_compile_options(vertex-fetch-prefix-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(vertex-fetch-prefix-test PRIVATE shadps4)
+target_compile_options(frame-camera-selection-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(frame-camera-selection-test PRIVATE shadps4)
 add_executable(shader-metadata-test EXCLUDE_FROM_ALL ../tests/test_shader_metadata.cpp
     ../tests/test_gpu_runtime_stubs.cpp)
 target_compile_options(shader-metadata-test PRIVATE -UNDEBUG)
@@ -257,7 +266,52 @@ target_compile_options(camera-motion-test PRIVATE -UNDEBUG -fPIC)
 target_link_libraries(camera-motion-test PRIVATE bbgpu)
 add_dependencies(camera-motion-test host_shaders)
 
+add_executable(frame-data-test EXCLUDE_FROM_ALL ../tests/test_frame_data.cpp
+    ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(frame-data-test PRIVATE shim shadps4 third_party/gcn/include)
+target_compile_options(frame-data-test PRIVATE -UNDEBUG -fPIC)
+target_link_libraries(frame-data-test PRIVATE bbgpu)
+if (WIN32)
+    target_link_libraries(frame-data-test PRIVATE onecore -pthread)
+endif()
+
+add_executable(sparse-residency-gpu-test EXCLUDE_FROM_ALL ../tests/test_sparse_residency_gpu.cpp
+    ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(sparse-residency-gpu-test PRIVATE shim shadps4 third_party/gcn/include)
+target_compile_options(sparse-residency-gpu-test PRIVATE -UNDEBUG -fPIC)
+target_link_libraries(sparse-residency-gpu-test PRIVATE bbgpu)
+if (WIN32)
+    target_link_libraries(sparse-residency-gpu-test PRIVATE onecore -pthread)
+endif()
+
 # bbport: FSR 4 benchmark outside the game (tools/fsr4_bench.cpp): ninja -C out/gpu fsr4-bench.
+add_executable(object-motion-targets-test EXCLUDE_FROM_ALL ../tests/test_object_motion_targets.cpp
+    ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(object-motion-targets-test PRIVATE shim shadps4 third_party/gcn/include)
+target_compile_options(object-motion-targets-test PRIVATE -UNDEBUG -fPIC)
+target_link_libraries(object-motion-targets-test PRIVATE bbgpu)
+if (WIN32)
+    target_link_libraries(object-motion-targets-test PRIVATE onecore -pthread)
+endif()
+
+add_executable(gpu-profiler-test EXCLUDE_FROM_ALL ../tests/test_gpu_profiler.cpp
+    ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(gpu-profiler-test PRIVATE shim shadps4 third_party/gcn/include)
+target_compile_options(gpu-profiler-test PRIVATE -UNDEBUG -fPIC)
+target_link_libraries(gpu-profiler-test PRIVATE bbgpu)
+if (WIN32)
+    target_link_libraries(gpu-profiler-test PRIVATE onecore -pthread)
+endif()
+
+add_executable(linear-image-readback-test EXCLUDE_FROM_ALL ../tests/test_linear_image_readback.cpp
+    ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(linear-image-readback-test PRIVATE shim shadps4 third_party/gcn/include)
+target_compile_options(linear-image-readback-test PRIVATE -UNDEBUG -fPIC)
+target_link_libraries(linear-image-readback-test PRIVATE bbgpu)
+if (WIN32)
+    target_link_libraries(linear-image-readback-test PRIVATE onecore -pthread)
+endif()
+
 add_executable(upscaler-support-test EXCLUDE_FROM_ALL ../tests/test_upscaler_support.cpp
     shim/bbport_settings.cpp)
 target_include_directories(upscaler-support-test PRIVATE shim)

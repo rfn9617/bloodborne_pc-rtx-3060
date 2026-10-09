@@ -29,12 +29,21 @@ GpuProfiler::GpuProfiler(const Instance& instance, Scheduler& scheduler_)
     for (auto& k : keys) {
         k.reserve(SliceQueries);
     }
-    std::printf("GPU profile: on (timestamp period %.2f ns)\n", period_ns);
+    if (const char* value = std::getenv("BB_GPU_PROFILE_EVERY")) {
+        char* end = nullptr;
+        const auto parsed = std::strtoul(value, &end, 10);
+        if (end != value && *end == '\0' && parsed >= 1 && parsed <= 1000000) {
+            every = static_cast<u32>(parsed);
+        }
+    }
+    std::printf("GPU profile: on (timestamp period %.2f ns, one frame in %u, nonblocking)\n",
+                period_ns, every);
 }
 
 void GpuProfiler::WriteTimestamp(u64 key) {
     if (used[slice] + 1 >= SliceQueries) {
-        return; // the frame's slice is full: the rest of the frame goes to the last label
+        truncated[slice] = true;
+        return; // discard this frame's incomplete attribution when collecting it
     }
     // Outside render passes: radv_CmdWriteTimestamp2 crashed inside some. Marks sit where a
     // pass, dispatch or submission ends anyway.
@@ -49,45 +58,67 @@ void GpuProfiler::WriteTimestamp(u64 key) {
 
 void GpuProfiler::BeginFrame() {
     // Close the frame: one more timestamp without a label.
-    if (used[slice] > 0 && used[slice] < SliceQueries) {
+    if (recording && used[slice] > 0 && used[slice] < SliceQueries) {
         scheduler.EndRendering();
         const u32 query = slice * SliceQueries + used[slice]++;
         scheduler.Record([pool = *pool, query](vk::CommandBuffer cmdbuf) {
             cmdbuf.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, pool, query);
         });
         pending[slice] = true;
+        ticks[slice] = scheduler.CurrentTick();
     }
+    recording = false;
+    current = 0;
     slice = (slice + 1) % NumSlices;
-    // The oldest slice: its frame was submitted four frames ago.
-    if (pending[slice]) {
-        Collect(slice);
+    // A delayed GPU or an unsubmitted command buffer must never block or have its queries reset.
+    if (!pending[slice] || Collect(slice)) {
+        if (used[slice]) {
+            device.resetQueryPool(*pool, slice * SliceQueries, used[slice]);
+        }
+        used[slice] = 0;
+        keys[slice].clear();
+        pending[slice] = false;
+        truncated[slice] = false;
     }
-    if (used[slice]) {
-        device.resetQueryPool(*pool, slice * SliceQueries, used[slice]);
+    if (diagnostics.observed_frames++ % every == 0) {
+        if (pending[slice]) {
+            ++diagnostics.busy_skips;
+        } else {
+            recording = true;
+            ++diagnostics.sampled_frames;
+        }
     }
-    used[slice] = 0;
-    keys[slice].clear();
-    pending[slice] = false;
     Print();
 }
 
-void GpuProfiler::Collect(u32 which) {
+bool GpuProfiler::Collect(u32 which) {
+    if (!scheduler.IsFree(ticks[which])) {
+        return false;
+    }
     const u32 count = used[which];
     std::vector<u64> stamps(count);
-    // Four frames on this is complete unless the GPU lags that far: then wait for it.
+    // The timeline is complete; omit eWait even if a driver still reports queries unavailable.
     const auto result = device.getQueryPoolResults(
         *pool, which * SliceQueries, count, count * sizeof(u64), stamps.data(), sizeof(u64),
-        vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
+        vk::QueryResultFlagBits::e64);
     if (result != vk::Result::eSuccess) {
-        return;
+        return false;
+    }
+    if (truncated[which]) {
+        ++diagnostics.truncated_frames;
+        return true;
     }
     for (u32 i = 0; i + 1 < count; ++i) {
         const double ms = double(stamps[i + 1] - stamps[i]) * period_ns / 1e6;
         auto& total = totals[keys[which][i]];
         total.ms += ms;
         ++total.segments;
+        ++diagnostics.collected_segments;
+        diagnostics.collected_ms += ms;
     }
     ++frames;
+    ++diagnostics.collected_frames;
+    return true;
 }
 
 void GpuProfiler::Print() {
@@ -102,8 +133,11 @@ void GpuProfiler::Print() {
     for (const auto& [key, total] : sorted) {
         sum += total.ms;
     }
-    std::printf("GPU profile: %.2f ms/frame over %llu frames, %zu labels\n", sum / frames,
-                static_cast<unsigned long long>(frames), sorted.size());
+    std::printf("GPU profile: %.2f ms/sampled-frame over %llu samples (every %u frames), "
+                "%zu labels; lifetime busy-skips=%llu truncated=%llu\n", sum / frames,
+                static_cast<unsigned long long>(frames), every, sorted.size(),
+                static_cast<unsigned long long>(diagnostics.busy_skips),
+                static_cast<unsigned long long>(diagnostics.truncated_frames));
     for (size_t i = 0; i < std::min<size_t>(sorted.size(), 30); ++i) {
         const auto& [key, total] = sorted[i];
         std::printf("  %6.3f ms/frame %5.1f/frame  %s\n", total.ms / frames,

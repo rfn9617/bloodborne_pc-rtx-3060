@@ -266,6 +266,8 @@ bool TemporalUpscaler::RasterScaling() const {
 }
 
 bool TemporalUpscaler::OnFrameStart() {
+    ReportDlssFrame();
+    frame_triggered = frame_invalid_input = false;
     // bbport: BB_PRESET_FILE=<file> holding a preset number, read about once a second: switches
     // the preset like the menu does (scripted tests of live preset changes).
     static const char* preset_file = std::getenv("BB_PRESET_FILE");
@@ -358,6 +360,7 @@ bool TemporalUpscaler::OnFrameStart() {
 }
 
 void TemporalUpscaler::OnDispatch(u64 cs_hash) {
+    if (cs_hash == trigger_hash) frame_triggered = true;
     if (cs_hash != trigger_hash || done_this_frame || failed || Scaled()) {
         return;
     }
@@ -524,7 +527,8 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
         return true;
     }
     if (use_fsr4) {
-        std::printf("Upscaler: FSR 4 inputs %ux%u -> %ux%u\n", w, h, ow, oh);
+        std::printf("Upscaler: %s inputs %ux%u -> %ux%u\n", UseDlss() ? "DLSS" : "FSR 4",
+                    w, h, ow, oh);
         return true;
     }
     FfxVkPortableMemoryUsage usage{};
@@ -1001,7 +1005,7 @@ bool TemporalUpscaler::RecordReactive(vk::ImageView color_view) {
 void TemporalUpscaler::Run() {
     if (auto* profiler = GpuProfiler::Get()) {
         const char* label = BbSettings::Get().upscaler == BbSettings::UpscalerTaa
-            ? "upscaler Run (TAA)" : "upscaler Run (FSR)";
+            ? "upscaler Run (TAA)" : UseDlss() ? "upscaler Run (DLSS)" : "upscaler Run (FSR)";
         profiler->Mark(0xF5A0'0000ull ^ std::hash<std::string_view>{}(label),
                        [label] { return std::string{label}; });
     }
@@ -1014,6 +1018,7 @@ void TemporalUpscaler::Run() {
     if (color.info.pixel_format != vk::Format::eR16G16B16A16Sfloat ||
         depth.info.size.width != ow || depth.info.size.height != oh ||
         !(color.usage_flags & vk::ImageUsageFlagBits::eStorage)) {
+        frame_invalid_input = true;
         return;
     }
     if (!EnsureResources(w, h, ow, oh, true)) {
@@ -1171,6 +1176,19 @@ void TemporalUpscaler::Run() {
     if (dispatched) {
         reset = false;
         dispatched_last_frame = true;
+        if (const int dump = DumpFrame(); dump >= 0) {
+            DumpImages(instance, scheduler, cmdbuf, dump,
+                       {{input_color, w, h, 8, "input", "rgba16f"},
+                        {vk::Image(motion_image), w, h, 4, "motion", "rg16f"},
+                        {vk::Image(output_image), ow, oh, 8, "output", "rgba16f"},
+                        {input_depth, w, h, 4, "depth", "f32", vk::ImageAspectFlagBits::eDepth}});
+            if (const auto object = camera_motion.ObjectMotionImage(w, h); object) {
+                DumpImages(instance, scheduler, cmdbuf, dump,
+                           {{object, w, h, 16, "objects", "rgba32f"}});
+            }
+            std::printf("Dump: HDR frame %d jitter %.9g %.9g, %.3f ms\n", dump,
+                        jitter[0], jitter[1], frame_ms);
+        }
         if (BbSettings::Get().upscaler != BbSettings::UpscalerTaa) {
             ExtraSharpen(cmdbuf, vk::Image(output_image), false, ow, oh);
         }
@@ -2002,9 +2020,11 @@ bool TemporalUpscaler::RecordDlss(vk::CommandBuffer cmdbuf, const Dlss::Resource
         scheduler.WaitSubmitted();
         dlss->ReleaseFeature();
         ok = dlss->CreateFeature(cmdbuf, desc);
+        ++dlss_stats.recreated;
         reset = true;
     }
     if (ok) {
+        if (reset) ++dlss_stats.resets;
         // The jitter and motion vectors FSR 3 gets: render pixels, current to previous.
         const float sign = BbToggle::Disabled(1u << 26) ? -1.0f : 1.0f;
         ok = dlss->Evaluate(cmdbuf, {
@@ -2021,14 +2041,48 @@ bool TemporalUpscaler::RecordDlss(vk::CommandBuffer cmdbuf, const Dlss::Resource
             // DLSS 2.5.1 and newer ignore their sharpness; ExtraSharpen runs RCAS instead.
             .sharpness = 0.0f,
         });
+        if (ok) ++dlss_stats.evaluated;
     }
     if (!ok) {
+        ++dlss_stats.errors;
         std::printf("Upscaler: DLSS failed; falling back to FSR 3.1\n");
         BbSettings::Get().upscaler = BbSettings::UpscalerFsr3;
         dlss_failed = true; // EnsureResources creates the FSR 3 context next frame
         reset = true;
     }
     return ok;
+}
+
+void TemporalUpscaler::ReportDlssFrame() {
+    if (!BbStats::enabled || applied_upscaler != BbSettings::UpscalerDlss) return;
+    ++dlss_stats.frames;
+    if (scene_color || camera_motion.Depth()) {
+        ++dlss_stats.scenes;
+        if (!dispatched_last_frame) {
+            if (frame_invalid_input) ++dlss_stats.invalid_input;
+            else if (!frame_triggered) ++dlss_stats.missing_trigger;
+            else ++dlss_stats.not_ready;
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - dlss_report_time < std::chrono::seconds(5)) return;
+    std::printf("DLSS frames: %llu display / %llu scene, %llu evaluated, %llu history resets, "
+                "%llu feature recreations; skipped: trigger %llu, not ready %llu, input %llu; "
+                "errors %llu; render %ux%u -> %ux%u, scene proxies %zu\n",
+                (unsigned long long)dlss_stats.frames, (unsigned long long)dlss_stats.scenes,
+                (unsigned long long)dlss_stats.evaluated, (unsigned long long)dlss_stats.resets,
+                (unsigned long long)dlss_stats.recreated,
+                (unsigned long long)dlss_stats.missing_trigger,
+                (unsigned long long)dlss_stats.not_ready,
+                (unsigned long long)dlss_stats.invalid_input,
+                (unsigned long long)dlss_stats.errors, width, height, out_width, out_height,
+                scene_targets.ProxyCount());
+    std::printf("DLSS camera: %llu snapshots, guest buffer changed before recording in "
+                "%llu snapshots (captured camera used)\n",
+                (unsigned long long)BbStats::camera_snapshots.exchange(0),
+                (unsigned long long)BbStats::camera_guest_changed.exchange(0));
+    dlss_report_time = now;
+    dlss_stats = {};
 }
 
 } // namespace Vulkan

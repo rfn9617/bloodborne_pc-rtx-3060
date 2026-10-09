@@ -20,6 +20,18 @@ def launcher():
 
 
 class WindowsProfileTests(unittest.TestCase):
+    def test_full_session_log_and_previous_run_preserved(self):
+        module = launcher()
+        with tempfile.TemporaryDirectory() as folder:
+            settings = {'user_dir': folder}
+            text = ''.join(f'frame {i}\n' for i in range(7000))
+            with module.open_run_log(settings) as log:
+                log.write(text)
+            with module.open_run_log(settings) as log:
+                log.write('next run\n')
+            self.assertEqual((Path(folder) / 'previous_run.log').read_text(), text)
+            self.assertEqual((Path(folder) / 'last_run.log').read_text(), 'next run\n')
+
     def test_profile_generation_and_minimal_defaults(self):
         with tempfile.TemporaryDirectory() as folder:
             target = Path(folder) / 'windows-profile.json'

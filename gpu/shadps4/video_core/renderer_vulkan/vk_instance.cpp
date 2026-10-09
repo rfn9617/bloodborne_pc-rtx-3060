@@ -850,6 +850,20 @@ u64 Instance::GetDeviceMemoryBudgetNow() const {
     return total_budget;
 }
 
+Instance::DeviceAllocationStats Instance::GetDeviceAllocationStats() const {
+    VmaBudget budgets[VK_MAX_MEMORY_HEAPS]{};
+    vmaGetHeapBudgets(allocator, budgets);
+    DeviceAllocationStats stats;
+    for (const size_t heap : valid_heaps) {
+        const auto& owned = budgets[heap].statistics;
+        stats.live_bytes += owned.allocationBytes;
+        stats.block_bytes += owned.blockBytes;
+        stats.allocations += owned.allocationCount;
+        stats.blocks += owned.blockCount;
+    }
+    return stats;
+}
+
 vk::FormatFeatureFlags2 Instance::GetFormatFeatureFlags(vk::Format format) const {
     const auto it = format_properties.find(format);
     if (it == format_properties.end()) {

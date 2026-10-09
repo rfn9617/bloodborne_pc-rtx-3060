@@ -218,16 +218,42 @@ void CameraMotion::RecordMotion(vk::CommandBuffer cmdbuf, vk::ImageView depth_vi
     cmdbuf.dispatch((width + 7) / 8, (height + 7) / 8, 1);
 }
 
-void CameraMotion::OnConstants(const float* data) {
-    // Scene constants: far plane 3000, 1/far, and the render size.
-    if (data[0] != 3000.0f || data[4] < 64.0f || data[5] < 64.0f ||
-        std::abs(data[1] * data[0] - 1.0f) > 1e-3f) {
-        return;
+void CameraMotion::OnConstants(const float* data, const float* live_guest) {
+    // Stage B reads the constant ring's mapped GPU memory here. Re-validating its
+    // signature for every draw is costly on uncached/device-local mappings. A
+    // selected view only needs the first valid camera, or one replacement when a
+    // larger view appears. Keep the legacy ordering available for comparisons.
+    static const bool fast_path = [] {
+        const char* value = std::getenv("BB_CAMERA_CONSTANT_FASTPATH");
+        return !value || value[0] != '0';
+    }();
+    const auto is_scene_camera = [&] {
+        // Preserve the original signature, including its NaN comparison behavior.
+        return !(data[0] != 3000.0f || data[4] < 64.0f || data[5] < 64.0f ||
+                 std::abs(data[1] * data[0] - 1.0f) > 1e-3f);
+    };
+    const auto capture = fast_path ? frame_camera.ConstantsIf(is_scene_camera)
+                                  : is_scene_camera() ? frame_camera.Constants()
+                                                      : FrameCameraSelection::Capture::Ignore;
+    if (capture == FrameCameraSelection::Capture::Ignore) return;
+    if (live_guest) {
+        BbStats::camera_snapshots.fetch_add(1, std::memory_order_relaxed);
+        if (std::memcmp(data + 8, live_guest + 8, 12 * sizeof(float)) != 0 ||
+            std::memcmp(data + 180, live_guest + 180, 12 * sizeof(float)) != 0 ||
+            data[52] != live_guest[52] || data[57] != live_guest[57] ||
+            data[62] != live_guest[62] || data[63] != live_guest[63]) {
+            BbStats::camera_guest_changed.fetch_add(1, std::memory_order_relaxed);
+        }
     }
-    if (frame_has_camera) {
-        return; // the first one of a frame is the main camera
+    if (capture == FrameCameraSelection::Capture::First) previous = current;
+    if (capture == FrameCameraSelection::Capture::Replace) {
+        static bool reported = false;
+        if (!reported) {
+            std::printf("Camera motion: main G-buffer replaced earlier auxiliary camera; "
+                        "previous-frame history preserved\n");
+            reported = true;
+        }
     }
-    previous = current;
     std::memcpy(current.view.data(), data + 8, 12 * sizeof(float));
     std::memcpy(current.inv_view.data(), data + 180, 12 * sizeof(float));
     // bbport: the projection as the motion shader uses it, ndc +y down the screen: the scales
@@ -247,21 +273,23 @@ void CameraMotion::OnConstants(const float* data) {
         std::printf("Camera motion: scene render size %ux%u\n", size[0], size[1]);
         render_size = size;
     }
-    frame_has_camera = true;
 }
 
-void CameraMotion::OnGBufferPass(VideoCore::ImageId depth, float x_sign, float y_sign) {
+bool CameraMotion::OnGBufferPass(VideoCore::ImageId depth, float x_sign, float y_sign) {
+    const auto& image = texture_cache.GetImage(depth);
+    if (!frame_camera.View(image.info.size.width, image.info.size.height)) return false;
     depth_id = depth;
     gbuffer_x_sign = x_sign;
     gbuffer_y_sign = y_sign;
+    return true;
 }
 
 void CameraMotion::OnDisplayPass(VideoCore::ImageId frame) {
     if (debug_overlay && frame && depth_id && current.valid && previous.valid) {
         Overlay(frame);
     }
-    if (!frame_has_camera) InvalidateHistory();
-    frame_has_camera = false;
+    if (!frame_camera.HasCamera()) InvalidateHistory();
+    frame_camera.Reset();
     depth_id = {};
 }
 

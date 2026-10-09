@@ -286,6 +286,7 @@ public:
 
     /// Runs the garbage collector.
     void RunGarbageCollector();
+    void SetSceneIdle(bool idle) { scene_idle = idle; }
 
     template <typename Func>
     void ForEachImageInRegion(VAddr cpu_addr, size_t size, Func&& func) {
@@ -346,7 +347,7 @@ private:
     }
 
     /// Copies image memory back to CPU.
-    void DownloadImageMemory(ImageId image_id, bool sync = false);
+    bool DownloadImageMemory(ImageId image_id, bool sync = false, bool for_gc = false);
 
     /// Thread function for copying downloaded images out to CPU memory.
     void DownloadedImagesThread(const std::stop_token& token);
@@ -385,6 +386,7 @@ private:
     }
 
     void GarbageCollectImages();
+    bool scene_idle = false;
     void GarbageCollectSamplers();
 
 private:
@@ -402,6 +404,8 @@ private:
     std::unordered_set<ImageId> download_images;
     u64 total_used_memory = 0;
     u64 gc_evictions = 0, gc_downloads = 0; ///< bbport: pressure report
+    u64 gc_unsafe_writebacks = 0;
+    u64 gc_tiled_downloads = 0, gc_tiled_writeback_second = ~0ULL;
     std::chrono::steady_clock::time_point gc_report_time{};
     /// bbport: gc_tick at the start of each of the last 64 seconds; the budget the marks use.
     GcAge gc_age;

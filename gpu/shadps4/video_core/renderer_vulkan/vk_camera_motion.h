@@ -12,6 +12,7 @@
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/texture_cache/image.h"
+#include "video_core/renderer_vulkan/frame_camera_selection.h"
 
 namespace VideoCore {
 class TextureCache;
@@ -53,6 +54,7 @@ public:
     [[nodiscard]] VideoCore::ImageId Depth() const noexcept {
         return depth_id;
     }
+    [[nodiscard]] bool HasFrameCamera() const noexcept { return frame_camera.HasCamera(); }
     /// The render size in the scene constants (the game's viewport; its targets may be
     /// allocated larger, e.g. 1916x1080 for a 1916x1078 scene), or zero before the first camera.
     [[nodiscard]] std::array<u32, 2> RenderSize() const noexcept {
@@ -70,14 +72,15 @@ public:
                       u32 width, u32 height);
 
     /// A bound constant buffer of 864 bytes: checks the scene constant signature.
-    void OnConstants(const float* data);
+    void OnConstants(const float* data, const float* live_guest = nullptr);
 
-    /// The G-buffer pass (5+ color targets): its depth is the scene depth.
+    /// A G-buffer pass (5+ color targets). Prefer the largest view in this frame;
+    /// return false for an auxiliary view smaller than the selected main view.
     /// `x_sign`/`y_sign`: signs of the G-buffer pass's viewport x/y scale (window = ndc * scale +
     /// offset). The motion shader takes ndc as +y down the screen, so the projection's scales are
     /// multiplied by them: the game's viewport decides which way view +y goes (from the base
     /// port's 0.4: a fixed sign smeared the background on stairs and when the camera pitched).
-    void OnGBufferPass(VideoCore::ImageId depth, float x_sign = 1.0f, float y_sign = 1.0f);
+    bool OnGBufferPass(VideoCore::ImageId depth, float x_sign = 1.0f, float y_sign = 1.0f);
 
     /// The pass copying the finished frame (`frame`, the last target drawn) to the display: the
     /// frame's depth and camera are complete. Records the debug overlay, starts a new frame.
@@ -105,7 +108,7 @@ private:
 
     ObjectMotion* object_motion = nullptr;
     Camera current, previous;
-    bool frame_has_camera = false;
+    FrameCameraSelection frame_camera;
     std::array<float, 2> jitter{}, previous_jitter{};
     std::array<u32, 2> render_size{};
     VideoCore::ImageId depth_id{};

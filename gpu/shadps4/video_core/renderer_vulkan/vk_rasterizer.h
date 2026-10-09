@@ -13,6 +13,7 @@
 #include "video_core/renderer_vulkan/vk_scene_resolution.h"
 #include "video_core/renderer_vulkan/vk_object_motion.h"
 #include "video_core/renderer_vulkan/vk_draw_pipe.h"
+#include "video_core/renderer_vulkan/pending_guest_writes.h"
 #include "video_core/renderer_vulkan/vk_draw_prep.h"
 #include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -329,6 +330,7 @@ private:
     std::unique_ptr<SceneTargets> scene_targets;
     bool scene_started = false;
     std::unique_ptr<ObjectMotion> object_motion;
+    std::chrono::steady_clock::time_point last_scene_frame = std::chrono::steady_clock::now();
     bool motion_draw = false;
     u64 motion_geometry{};    ///< vertex-stream identity of the current direct draw
     bool gbuffer_draw = false;
@@ -480,21 +482,14 @@ private:
         u64 offset; ///< in the ring
         VAddr address;
     };
-    struct PendingWrite {
-        VAddr begin;
-        VAddr end;
-        u64 position;
-    };
-    std::vector<PendingWrite> pending_writes;
-    VAddr pending_min = ~VAddr{0}, pending_max = 0; ///< bounds of pending_writes
-    u32 pending_checks = 0;
+    PendingGuestWrites pending_writes;
     u64 proxy_samples = 0; ///< texture bindings that read a scene proxy (statistics)
     float sampler_lod_bias = 0.0f; ///< bbport: extra bias of this draw's samplers
     float alpha_lod_bias = 0.0f; ///< fragment material samplers only
     int reported_alpha_detail = -1;
     u64 scene_collection_generation = 0;
     bool scene_debug_frame = false; ///< BB_SCENE_DEBUG: this frame's passes are printed
-    bool PendingWriteOverlaps(VAddr address, u64 size);
+    bool CanCaptureGuestBuffer(VAddr address, u64 size);
     /// Stage B: the ring bindings of the stages of the packet being recorded.
     struct RingStage {
         const Shader::Info* info;

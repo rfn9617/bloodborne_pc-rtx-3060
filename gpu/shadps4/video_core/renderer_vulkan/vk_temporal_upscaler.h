@@ -171,6 +171,13 @@ private:
     bool RecordDlss(vk::CommandBuffer cmdbuf, const Dlss::Resource& color,
                     const Dlss::Resource& depth, u32 w, u32 h, u32 ow, u32 oh, float frame_ms,
                     bool hdr);
+    void ReportDlssFrame();
+    struct DlssStats {
+        u64 frames = 0, scenes = 0, evaluated = 0, resets = 0, recreated = 0;
+        u64 missing_trigger = 0, not_ready = 0, invalid_input = 0, errors = 0;
+    } dlss_stats;
+    bool frame_triggered = false, frame_invalid_input = false;
+    std::chrono::steady_clock::time_point dlss_report_time{};
     /// Records FSR 4 into output_image; on a permanent failure FSR 3 takes over.
     bool RecordFsr4(vk::CommandBuffer cmdbuf, Fsr4Upscaler::Image color, Fsr4Upscaler::Image depth,
                     u32 w, u32 h, u32 ow, u32 oh, float frame_ms);

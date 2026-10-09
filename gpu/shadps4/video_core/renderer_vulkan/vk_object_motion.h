@@ -8,6 +8,8 @@
 #pragma once
 
 #include <array>
+#include <map>
+#include <memory>
 #include "video_core/renderer_vulkan/motion_history.h"
 
 #include "common/types.h"
@@ -54,15 +56,23 @@ public:
     vk::ImageView PrepareRead(vk::CommandBuffer cmdbuf, u32 width, u32 height, bool& valid);
     /// The image of the last PrepareRead (layout General), or null.
     [[nodiscard]] vk::ImageView View() const noexcept {
-        return view ? *view : vk::ImageView{};
+        return read_image ? *read_image->view : vk::ImageView{};
     }
     [[nodiscard]] vk::Image Image(u32 width, u32 height) const noexcept {
-        return written && width == image_width && height == image_height
-            ? vk::Image(image) : vk::Image{};
+        const auto found = images.find({width, height});
+        return found != images.end() && found->second->written
+            ? vk::Image(found->second->image) : vk::Image{};
     }
 
 private:
-    void EnsureImage(u32 width, u32 height);
+    struct MotionImage {
+        VideoCore::UniqueImage image;
+        vk::UniqueImageView view;
+        bool written = false;
+        u64 last_frame = 0;
+        vk::ImageLayout layout = vk::ImageLayout::eUndefined;
+    };
+    MotionImage& EnsureImage(u32 width, u32 height);
 
     const Instance& instance;
     Scheduler& scheduler;
@@ -85,11 +95,10 @@ private:
 
     u64 frame = 0;
     u32 params_used = 0;
-    VideoCore::UniqueImage image;
-    vk::UniqueImageView view;
-    u32 image_width = 0, image_height = 0;
-    bool written = false; ///< this frame's vectors are in the image
-    vk::ImageLayout image_layout = vk::ImageLayout::eUndefined;
+    // Auxiliary and main G-buffers can alternate resolutions within every frame.
+    // Reuse each attachment instead of draining the GPU and reallocating on every switch.
+    std::map<std::pair<u32, u32>, std::unique_ptr<MotionImage>> images;
+    MotionImage* read_image = nullptr;
 };
 
 } // namespace Vulkan

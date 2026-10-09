@@ -4,11 +4,18 @@
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#ifdef _WIN32
+#define NDEBUG // match the renderer's Vulkan-Hpp dispatcher layout
+#endif
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/host_shaders/camera_motion_comp.h"
 #include <vk_mem_alloc.h>
+#ifdef _WIN32
+#undef NDEBUG
+#include <cassert>
+#endif
 
 int main() {
     Vulkan::Instance instance(0, false);

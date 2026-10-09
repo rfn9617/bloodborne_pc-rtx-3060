@@ -6,6 +6,7 @@
 #include "bbport_copy.h"
 
 #include <deque>
+#include <map>
 #include <boost/container/small_vector.hpp>
 
 #include "common/interval_set.h"
@@ -14,6 +15,7 @@
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
+#include "video_core/texture_cache/gc_age.h"
 
 namespace AmdGpu {
 struct Liverpool;
@@ -112,6 +114,14 @@ public:
     /// Commits pending sparse buffer memory binds. Must be called before every scheduler submit.
     void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);
 
+    /// Physical sparse-buffer backing is allocated outside VMA; include it in VRAM reports.
+    [[nodiscard]] u64 ResidentBytes() const noexcept { return resident_bytes; }
+
+    /// Release fully unmapped sparse pages after their GPU submissions complete.
+    void ReleaseUnmappedMemory(VAddr address, u64 size, bool assume_gpu_thread = false);
+    /// Retire unused allocations while no 3D scene or indirect shader accesses are active.
+    void CollectIdleMemory(u64 second, bool scene_idle);
+
 private:
     struct ArenaBinds {
         const Buffer* arena;
@@ -129,8 +139,15 @@ private:
     const Buffer* GetArena(u64 first_block, u64 last_block);
 
     void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
+    u64 resident_bytes = 0;
+    struct SparseAllocation { u64 bytes; u64 last_use; };
+    std::map<vk::DeviceMemory, SparseAllocation> sparse_allocations;
+    GcAge residency_age;
+    u64 last_residency_gc = 0;
+    u64 last_dma_tick = 0;
+    vk::DeviceMemory residency_gc_cursor{};
 
-    void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
+    bool DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
 
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
                            bool is_texel_buffer);
@@ -177,7 +194,7 @@ private:
 
     struct Backing : public Interval {
         vk::DeviceMemory memory;
-        u64 offset;
+        u64 offset; ///< Offset in sparse blocks, matching start/end (not bytes).
         constexpr bool CanMergeWith(const Backing& other) const noexcept {
             return memory == other.memory && offset + (end - start) == other.offset;
         }
