@@ -50,7 +50,7 @@ int main() {
         const auto merged_end = MergedEnd(merged_base,merged_base+declared,requests);
         for (const auto& request : requests) {
             assert(request.base+request.size <= merged_end);
-            const std::uint32_t indices[] = {0, 65535, random()%65536, random()%65536};
+            const std::uint32_t indices[] = {0, 65535, std::uint32_t(random()%65536), std::uint32_t(random()%65536)};
             for (auto index : indices) {
                 assert(request.base+(std::uint64_t(index)+first)*stride+16 <= merged_end);
             }
