@@ -40,6 +40,15 @@ std::filesystem::path ExecutableDirectory() {
     return std::filesystem::path{path}.parent_path();
 }
 
+// bbport: where nvngx_dlss.dll is: next to bb-probe.exe, or BB_NGX_DIR (a test renderer in its
+// own folder can use the installed DLSS runtime instead of a second 60 MB copy).
+std::filesystem::path NgxDirectory() {
+    if (const char* dir = std::getenv("BB_NGX_DIR"); dir && dir[0]) {
+        return std::filesystem::path{dir};
+    }
+    return ExecutableDirectory();
+}
+
 void BridgeLog(int warning, const char* message) {
     std::printf("DLSS: %s%s\n", warning ? "warning: " : "", message);
 }
@@ -92,7 +101,7 @@ Dlss* Dlss::Get() {
         }
         const auto directory = ExecutableDirectory();
         if (!std::filesystem::is_regular_file(directory / BridgeName) ||
-            !std::filesystem::is_regular_file(directory / NgxName)) {
+            !std::filesystem::is_regular_file(NgxDirectory() / NgxName)) {
             return nullptr;
         }
         auto* created = new Dlss;
@@ -125,7 +134,7 @@ Dlss::Dlss() : impl{std::make_unique<Impl>()} {
     }
     std::error_code error;
     std::filesystem::create_directories(data, error);
-    if (!impl->api->Configure(directory.c_str(), data.c_str(), BridgeLog)) {
+    if (!impl->api->Configure(NgxDirectory().c_str(), data.c_str(), BridgeLog)) {
         impl->Disable("bridge configuration failed");
     }
 }
