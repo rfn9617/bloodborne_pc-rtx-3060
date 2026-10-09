@@ -195,11 +195,14 @@ private:
     struct Backing : public Interval {
         vk::DeviceMemory memory;
         u64 offset; ///< Offset in sparse blocks, matching start/end (not bytes).
+        /// bbport: the entry of `memory` in sparse_allocations (map nodes do not move; the entry
+        /// is erased only once no backing refers to it). Saves a map lookup per binding.
+        SparseAllocation* allocation;
         constexpr bool CanMergeWith(const Backing& other) const noexcept {
             return memory == other.memory && offset + (end - start) == other.offset;
         }
         constexpr Backing SubRange(u64 a, u64 b) const noexcept {
-            return {{a, b}, memory, offset + (a - start)};
+            return {{a, b}, memory, offset + (a - start), allocation};
         }
     };
     IntervalList<Backing> resident_ranges;

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+#include <cstring>
 #include <xxhash.h>
 
 #include "bbport_toggles.h"
@@ -856,6 +858,32 @@ void TextureCache::RefreshImage(Image& image) {
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
                                      AmdGpu::BorderColorBuffer border_color_base,
                                      const bool is_depth, float extra_lod_bias) {
+    // bbport: the samplers this thread found recently, without the hash and the lock. An entry
+    // holds within one GC tick (the lookup below refreshes the LRU tick once per tick) and
+    // until a sampler is destroyed.
+    struct Memo {
+        AmdGpu::Sampler sampler;
+        u64 border, tick, generation;
+        u32 bias;
+        bool depth;
+        vk::Sampler handle;
+    };
+    thread_local std::array<Memo, 64> memo{};
+    static_assert(sizeof(AmdGpu::Sampler) % sizeof(u64) == 0);
+    u64 words[sizeof(AmdGpu::Sampler) / sizeof(u64)];
+    std::memcpy(words, &sampler, sizeof(words));
+    const u32 bias = std::bit_cast<u32>(extra_lod_bias);
+    const bool use_memo = !BbToggle::Disabled(BbToggle::SamplerMemo);
+    u64 mix = bias ^ (u64(is_depth) << 40);
+    for (const u64 word : words) mix = (mix ^ word) * 0x9E3779B97F4A7C15ull;
+    Memo& slot = memo[(mix >> 58) & 63];
+    const u64 generation = sampler_generation.load(std::memory_order_acquire);
+    if (use_memo && slot.handle && slot.tick == gc_tick && slot.generation == generation &&
+        slot.bias == bias && slot.depth == is_depth && slot.border == u64(border_color_base.base_addr) &&
+        std::memcmp(&slot.sampler, &sampler, sizeof(sampler)) == 0) {
+        return slot.handle;
+    }
+
     // Compare and plain uses of one S# need separate samplers; so do extra LOD biases.
     const u64 hash = HashCombine(HashCombine(XXH3_64bits(&sampler, sizeof(sampler)), is_depth),
                                  u64(std::bit_cast<u32>(extra_lod_bias)));
@@ -868,7 +896,10 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
     } else {
         sampler_lru_cache.Touch(it->second.lru_id, gc_tick);
     }
-
+    if (use_memo) {
+        slot = {sampler, u64(border_color_base.base_addr), gc_tick, generation, bias, is_depth,
+                it->second.Handle()};
+    }
     return it->second.Handle();
 }
 
@@ -1247,6 +1278,7 @@ void TextureCache::GarbageCollectSamplers() {
         }
         --num_deletions;
         const size_t lru_id = samplers.at(hash).lru_id;
+        sampler_generation.fetch_add(1, std::memory_order_acq_rel); // drops GetSampler memos
         samplers.erase(hash);
         sampler_lru_cache.Free(lru_id);
         return false;

@@ -471,9 +471,21 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
 }
 
 void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
-    resident_ranges.ForEachInRange(first_block, last_block + 1, [&](const Backing& backing) {
-        sparse_allocations.at(backing.memory).last_use = scheduler.CurrentTick();
-    });
+    // bbport: one pass over the overlapping backings marks their allocations used; the gap
+    // search and the allocation below only run when some block is not resident yet.
+    const u64 tick = scheduler.CurrentTick();
+    if (BbToggle::Disabled(BbToggle::ResidencyFastPath)) {
+        resident_ranges.ForEachInRange(first_block, last_block + 1, [&](const Backing& backing) {
+            sparse_allocations.at(backing.memory).last_use = tick;
+        });
+    } else if (resident_ranges.VisitCovering(first_block, last_block + 1,
+                                             [tick](const Backing& backing) {
+                                                 if (backing.allocation->last_use != tick) {
+                                                     backing.allocation->last_use = tick;
+                                                 }
+                                             })) {
+        return;
+    }
     u32 resident_blocks{};
     IntervalList bind_ranges;
     resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64 start, u64 end) {
@@ -492,8 +504,11 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     };
     const auto device_memory = Vulkan::Check(instance.GetDevice().allocateMemory(alloc_info));
     resident_bytes += alloc_info.allocationSize;
-    sparse_allocations.emplace(device_memory, SparseAllocation{alloc_info.allocationSize,
-                                                               scheduler.CurrentTick()});
+    SparseAllocation* const allocation =
+        &sparse_allocations
+             .emplace(device_memory,
+                      SparseAllocation{alloc_info.allocationSize, scheduler.CurrentTick()})
+             .first->second;
 
     boost::container::small_vector<vk::BufferCopy, 8> copies;
     const auto staging =
@@ -509,6 +524,7 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         backing.end = range.end;
         backing.memory = device_memory;
         backing.offset = memory_offset >> block_shift;
+        backing.allocation = allocation;
         resident_ranges.Add(backing);
 
         LOG_INFO(Render, "Making range start={}, end={} resident", backing.start, backing.end);

@@ -154,6 +154,24 @@ public:
         }
     }
 
+    /// bbport: calls 'func' for each interval that partially overlaps the range and returns
+    /// whether those intervals cover all of it (one search instead of ForEachInRange followed
+    /// by ForEachGap).
+    bool VisitCovering(u64 start, u64 end, auto&& func) const {
+        if (start >= end) [[unlikely]] {
+            return true;
+        }
+        auto it = std::ranges::upper_bound(intervals, start, {}, &IV::end);
+        u64 cur = start;
+        bool covered = true;
+        for (; it != intervals.end() && it->start < end; ++it) {
+            func(*it);
+            covered &= it->start <= cur;
+            cur = std::max(cur, it->end);
+        }
+        return covered && cur >= end;
+    }
+
     /// Calls 'func' for each interval that partially overlaps provided range.
     void ForEachInRange(u64 start, u64 end, auto&& func) const {
         if (start >= end) [[unlikely]] {

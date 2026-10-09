@@ -1079,7 +1079,8 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                 if (captured && captured->size >= size) {
                     // Match the constants this draw binds, even if the guest reused its RAM.
                     // Stage A hashed them; the ring itself is slow for the CPU to read.
-                    bytes_hash = captured->hash && captured->size == size
+                    bytes_hash = captured->hash && captured->size == size &&
+                                         !BbToggle::Disabled(BbToggle::PaletteHashStageA)
                                      ? captured->hash
                                      : XXH3_64bits(constant_ring->Data(captured->offset), size);
                 } else if (buffer_cache.IsRegionGpuModified(address, size)) {
@@ -1127,7 +1128,10 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                                           s32(base_vertex), restart);
                             return Motion::IndexRangeCache::Result{scan_range,
                                                                    XXH3_64bits(data, bytes)};
-                        });
+                        },
+                        BbToggle::Disabled(BbToggle::IndexRangeLongCache)
+                            ? 32
+                            : Motion::IndexRangeCache::Revalidate);
                     range = scanned.range;
                     topology = scanned.topology;
                 }

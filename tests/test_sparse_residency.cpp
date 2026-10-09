@@ -34,5 +34,20 @@ int main() {
     assert(ranges.Size() == 2);
     ranges.Subtract(1, 1); // Empty request.
     assert(ranges.Size() == 2);
-    std::puts("Sparse ranges: splits, shared allocations, offsets, gaps and final removal PASS");
+    // VisitCovering (EnsureResident's fast path): visits overlaps, reports full coverage only.
+    IntervalList<Backing> cover;
+    cover.Add({{0, 4}, 1, 0});
+    cover.Add({{4, 8}, 2, 0}); // adjacent, another allocation: not merged
+    cover.Add({{10, 12}, 3, 0});
+    int visited = 0;
+    assert(cover.VisitCovering(1, 7, [&](const Backing&) { ++visited; }) && visited == 2);
+    visited = 0;
+    assert(!cover.VisitCovering(6, 11, [&](const Backing&) { ++visited; }) && visited == 2);
+    assert(!cover.VisitCovering(8, 10, [](const Backing&) {}));   // gap only
+    assert(!cover.VisitCovering(11, 13, [](const Backing&) {}));  // runs past the last one
+    assert(!cover.VisitCovering(20, 30, [](const Backing&) {}));  // after everything
+    assert(cover.VisitCovering(10, 12, [](const Backing&) {}));
+    assert(cover.VisitCovering(5, 5, [](const Backing&) {}));     // empty request
+    std::puts("Sparse ranges: splits, shared allocations, offsets, gaps, coverage and final "
+              "removal PASS");
 }

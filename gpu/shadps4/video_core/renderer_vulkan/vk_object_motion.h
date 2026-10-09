@@ -40,8 +40,9 @@ public:
     /// Index range and topology hash of an indexed draw, reused across frames.
     template <class Scan>
     Motion::IndexRangeCache::Result IndexRange(const Motion::IndexRangeCache::Key& key,
-                                               Scan&& scan) {
-        return index_ranges.Get(key, frame, scan);
+                                               Scan&& scan,
+                                               u64 revalidate = Motion::IndexRangeCache::Revalidate) {
+        return index_ranges.Get(key, frame, scan, revalidate);
     }
 
     /// Rendering of a motion pipeline: the motion attachment (render-target size).

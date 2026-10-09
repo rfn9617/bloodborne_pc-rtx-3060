@@ -57,7 +57,9 @@ inline BufferRole ClassifyBuffer(uint32_t size) {
 // shader bounds every history access by the stored range.
 class IndexRangeCache {
 public:
-    static constexpr uint64_t Revalidate = 32, Unused = 600;
+    /// Every 240 frames (bbport, 2026-10-10: 32 before; scans found no change in hours of
+    /// play, and at ~36 scans a frame they were ~5% of the draw recording thread).
+    static constexpr uint64_t Revalidate = 240, Unused = 600;
     struct Key {
         uint64_t address{};
         uint32_t count{}, index_size{};
@@ -74,10 +76,10 @@ public:
     } stats;
 
     template <class Scan>
-    Result Get(const Key& key, uint64_t frame, Scan&& scan) {
+    Result Get(const Key& key, uint64_t frame, Scan&& scan, uint64_t revalidate = Revalidate) {
         auto& entry = entries[key];
         entry.last_use = frame;
-        if (entry.valid && frame - entry.verified < Revalidate) {
+        if (entry.valid && frame - entry.verified < revalidate) {
             ++stats.hits;
             return entry.result;
         }

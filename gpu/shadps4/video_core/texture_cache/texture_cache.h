@@ -401,6 +401,7 @@ private:
     Common::SlotVector<Image> slot_images;
     Common::SlotVector<ImageView> slot_image_views;
     tsl::robin_map<u64, Sampler> samplers;
+    std::atomic<u64> sampler_generation{0}; ///< bbport: samplers destroyed (GetSampler memo)
     std::unordered_set<ImageId> download_images;
     u64 total_used_memory = 0;
     u64 gc_evictions = 0, gc_downloads = 0; ///< bbport: pressure report
