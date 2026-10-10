@@ -418,7 +418,7 @@ struct PictureSchedule {
     }();
     std::chrono::steady_clock::time_point series_start{}, last{};
     std::chrono::milliseconds every{150};
-    u32 series = 0, taken = 0, limit = 0, loading_series = 0;
+    u32 series = 0, taken = 0, limit = 0, loading_series = 0, snapshot_seen = 0;
     bool loading = false, active = false;
     char kind[16] = {};
 
@@ -427,12 +427,16 @@ struct PictureSchedule {
         if (!enabled) return {};
         const auto now = std::chrono::steady_clock::now();
         const bool loading_now = BbStats::loading_screen.load(std::memory_order_relaxed);
-        if (BbStats::frame_burst_request.exchange(false, std::memory_order_relaxed)) {
-            Start(now, "f9", std::chrono::milliseconds(100), 40);
+        if (const u32 seq = BbStats::snapshot_seq.load(std::memory_order_relaxed);
+            seq != snapshot_seen) {
+            snapshot_seen = seq;
+            Start(now, "f10_", std::chrono::milliseconds(100), 1);
+        } else if (BbStats::frame_burst_request.exchange(false, std::memory_order_relaxed)) {
+            Start(now, "f9_", std::chrono::milliseconds(100), 40);
         } else if (loading_now && !loading && loading_series < 3 &&
                    !(active && kind[0] == 'f')) {
             ++loading_series;
-            Start(now, "loading", std::chrono::milliseconds(150), 40);
+            Start(now, "loading_", std::chrono::milliseconds(150), 40);
         }
         loading = loading_now;
         if (active && kind[0] == 'l' && !loading_now) {

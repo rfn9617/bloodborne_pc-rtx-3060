@@ -598,6 +598,13 @@ bool HandleEvent(const SDL_Event& event) {
             BbStats::frame_burst_request.store(true, std::memory_order_relaxed);
             return true;
         }
+        // F10: one picture, the next frame's passes (FrameCapture) and the upscaler's inputs.
+        if (down && !event.key.repeat && event.key.key == SDLK_F10 &&
+            std::getenv("BB_FRAME_PICTURES")) {
+            const unsigned seq = BbStats::snapshot_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+            std::printf("Snapshot %u requested (F10)\n", seq);
+            return true;
+        }
         if (down && !event.key.repeat &&
             (event.key.key == SDLK_INSERT || (is_open && event.key.key == SDLK_ESCAPE))) {
             SetOpen(event.key.key == SDLK_INSERT ? !is_open : false);

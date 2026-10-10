@@ -61,6 +61,18 @@ FfxVkPortableImage Describe(vk::Image image, vk::Format format, u32 width, u32 h
 int DumpFrame() {
     static const char* trigger = std::getenv("BB_DUMP_TRIGGER");
     static int remaining = 0, index = 0, polls = 0;
+    // F10 (BB_FRAME_PICTURES): two frames, numbered on from earlier snapshots.
+    static u32 snapshot_seen = 0;
+    if (const u32 seq = BbStats::snapshot_seq.load(std::memory_order_relaxed);
+        remaining == 0 && seq != snapshot_seen) {
+        snapshot_seen = seq;
+        remaining = 2;
+        std::printf("Snapshot %u: upscaler images f%03d and f%03d\n", seq, index, index + 1);
+    }
+    if (remaining > 0 && !trigger) {
+        --remaining;
+        return index++;
+    }
     if (!trigger) {
         return -1;
     }

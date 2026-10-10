@@ -125,6 +125,8 @@ inline std::atomic<std::uint64_t> barrier_calls{0}, barrier_images{0};
 inline std::atomic<bool> loading_screen{false};
 /// F9: save the next few seconds of presented frames as pictures (Presenter::PrepareFrame).
 inline std::atomic<bool> frame_burst_request{false};
+/// F10: a diagnostic snapshot (picture, frame analysis, upscaler inputs); +1 per press.
+inline std::atomic<std::uint32_t> snapshot_seq{0};
 /// This loading screen goes without the frame limit (BB_FAST_LOADING, the present thread).
 inline std::atomic<bool> loading_unlimited{false};
 /// Render pass instances begun (Scheduler::BeginRendering).

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
+#include "bbport_toggles.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -85,8 +86,9 @@ void AddShader(Entry& entry, u64 hash) {
 
 void Write(VAddr presented) {
     const char* dir = std::getenv("BB_CAPTURE_DIR");
-    const std::string path =
-        std::format("{}/frame_{}.txt", dir ? dir : ".", static_cast<long long>(std::time(nullptr)));
+    static u32 written = 0;
+    const std::string path = std::format("{}/frame_{}_{}.txt", dir ? dir : ".",
+                                         static_cast<long long>(std::time(nullptr)), ++written);
     FILE* f = std::fopen(path.c_str(), "w");
     if (!f) {
         std::printf("Frame capture: cannot write %s\n", path.c_str());
@@ -131,6 +133,15 @@ void FrameCapture::OnFlip(VAddr presented_address) {
     last_presented.store(presented_address, std::memory_order_relaxed);
     flips.fetch_add(1, std::memory_order_release);
     static const char* trigger = std::getenv("BB_CAPTURE_TRIGGER");
+    // F10 (BB_FRAME_PICTURES): the next frame too.
+    static u32 snapshot_seen = 0;
+    if (const u32 seq = BbStats::snapshot_seq.load(std::memory_order_relaxed);
+        seq != snapshot_seen && state.load(std::memory_order_relaxed) == Idle) {
+        snapshot_seen = seq;
+        state.store(Armed, std::memory_order_release);
+        std::printf("Frame capture: armed (snapshot %u)\n", seq);
+        return;
+    }
     if (trigger && state.load(std::memory_order_relaxed) == Idle &&
         std::filesystem::exists(trigger)) {
         std::error_code ec;
