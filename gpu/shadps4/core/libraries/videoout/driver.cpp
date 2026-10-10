@@ -12,6 +12,7 @@
 #endif
 #include "common/assert.h"
 #include "bbport_toggles.h"
+#include "bbport_power.h"
 #include "bbport_vblank_clock.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
@@ -474,6 +475,7 @@ void VideoOutDriver::Flip(const Request& req) {
                             median, std::sqrt(std::max(0.0, sq / intervals.size() - mean * mean)),
                             sorted[std::min(sorted.size() - 1, sorted.size() * 99 / 100)], spikes);
             }
+            BbPower::PrintWindow(window);
             intervals.clear();
             window_start = now;
             frames = 0;

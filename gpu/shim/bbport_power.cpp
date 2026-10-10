@@ -1,0 +1,262 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bbport: see bbport_power.h.
+#include "bbport_power.h"
+
+#ifdef _WIN32
+
+#include <windows.h>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <string>
+#include <thread>
+
+namespace BbPower {
+
+namespace {
+
+// NVML (nvml.h), only what is used here.
+using NvmlReturn = int;
+using NvmlDevice = void*;
+struct NvmlUtilization {
+    unsigned int gpu, memory;
+};
+using InitFn = NvmlReturn (*)();
+using HandleFn = NvmlReturn (*)(unsigned int, NvmlDevice*);
+using UintFn = NvmlReturn (*)(NvmlDevice, unsigned int*);
+using ClockFn = NvmlReturn (*)(NvmlDevice, int, unsigned int*);
+using TemperatureFn = NvmlReturn (*)(NvmlDevice, int, unsigned int*);
+using UtilizationFn = NvmlReturn (*)(NvmlDevice, NvmlUtilization*);
+using ReasonsFn = NvmlReturn (*)(NvmlDevice, unsigned long long*);
+constexpr int ClockGraphics = 0, ClockMemory = 2, TemperatureGpu = 0;
+
+template <class Function>
+Function Load(HMODULE module, const char* name) {
+    return reinterpret_cast<Function>(reinterpret_cast<void (*)()>(GetProcAddress(module, name)));
+}
+
+uint64_t FileTime(const FILETIME& time) {
+    return (uint64_t(time.dwHighDateTime) << 32) | time.dwLowDateTime;
+}
+
+struct Window {
+    double power_mw = 0, graphics_mhz = 0, memory_mhz = 0, load = 0;
+    unsigned samples = 0, power_samples = 0, max_temperature = 0, min_graphics_mhz = ~0u;
+    unsigned long long reasons = 0;
+};
+
+class Monitor {
+public:
+    Monitor() {
+        const char* stats = std::getenv("BB_FRAME_STATS");
+        if (!stats || stats[0] != '1') {
+            return;
+        }
+        enabled = true;
+        HMODULE nvml = LoadLibraryW(L"nvml.dll");
+        if (!nvml) {
+            nvml = LoadLibraryW(L"C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvml.dll");
+        }
+        if (nvml) {
+            const auto init = Load<InitFn>(nvml, "nvmlInit_v2");
+            const auto handle = Load<HandleFn>(nvml, "nvmlDeviceGetHandleByIndex_v2");
+            power = Load<UintFn>(nvml, "nvmlDeviceGetPowerUsage");
+            power_limit = Load<UintFn>(nvml, "nvmlDeviceGetEnforcedPowerLimit");
+            clock = Load<ClockFn>(nvml, "nvmlDeviceGetClockInfo");
+            temperature = Load<TemperatureFn>(nvml, "nvmlDeviceGetTemperature");
+            utilization = Load<UtilizationFn>(nvml, "nvmlDeviceGetUtilizationRates");
+            reasons = Load<ReasonsFn>(nvml, "nvmlDeviceGetCurrentClocksEventReasons");
+            if (!reasons) {
+                reasons = Load<ReasonsFn>(nvml, "nvmlDeviceGetCurrentClocksThrottleReasons");
+            }
+            if (init && handle && init() == 0 && handle(0, &device) == 0) {
+                gpu = true;
+            }
+        }
+        std::printf("Power: statistics on (%s)\n",
+                    gpu ? "process and machine CPU time, NVIDIA GPU through NVML"
+                        : "process and machine CPU time; NVML not available");
+        if (gpu) {
+            sampler = std::thread([this] { Sample(); });
+            sampler.detach();
+        }
+        Reset();
+    }
+
+    void Print(double seconds) {
+        if (!enabled) {
+            return;
+        }
+        FILETIME creation, exit, kernel, user, idle, system_kernel, system_user;
+        uint64_t process = 0;
+        if (GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user)) {
+            process = FileTime(kernel) + FileTime(user);
+        }
+        uint64_t machine_busy = 0, machine_total = 0;
+        if (GetSystemTimes(&idle, &system_kernel, &system_user)) {
+            // Kernel time includes idle time.
+            machine_total = FileTime(system_kernel) + FileTime(system_user);
+            machine_busy = machine_total - FileTime(idle);
+        }
+        const double process_cores = (process - last_process) / (seconds * 1e7);
+        const double machine_load = machine_total > last_machine_total
+                                        ? 100.0 * double(machine_busy - last_machine_busy) /
+                                              double(machine_total - last_machine_total)
+                                        : 0.0;
+        last_process = process;
+        last_machine_busy = machine_busy;
+        last_machine_total = machine_total;
+
+        std::string line;
+        char buffer[256];
+        std::snprintf(buffer, sizeof(buffer),
+                      "Power: process CPU %.2f cores, machine CPU %.0f%% busy", process_cores,
+                      machine_load);
+        line = buffer;
+        if (gpu) {
+            Window window;
+            {
+                std::scoped_lock lock{mutex};
+                window = current;
+                current = {};
+            }
+            if (window.samples) {
+                const double n = window.samples;
+                std::snprintf(buffer, sizeof(buffer),
+                              "; GPU load %.0f%%, graphics clock %.0f MHz (min %u), memory %.0f MHz, "
+                              "max %u C",
+                              window.load / n, window.graphics_mhz / n, window.min_graphics_mhz,
+                              window.memory_mhz / n, window.max_temperature);
+                line += buffer;
+                if (window.power_samples) {
+                    unsigned limit = 0;
+                    if (!power_limit || power_limit(device, &limit) != 0) {
+                        limit = 0;
+                    }
+                    std::snprintf(buffer, sizeof(buffer), ", power %.1f W (limit %.0f W)",
+                                  window.power_mw / window.power_samples / 1000.0, limit / 1000.0);
+                    line += buffer;
+                }
+                // Reasons other than idle: what held the clock below its maximum.
+                struct {
+                    unsigned long long bit;
+                    const char* name;
+                } constexpr names[] = {{0x4, "power cap"},        {0x8, "hardware slowdown"},
+                                       {0x20, "thermal (software)"}, {0x40, "thermal (hardware)"},
+                                       {0x80, "power brake"},      {0x2, "application clocks"},
+                                       {0x10, "sync boost"},       {0x100, "display clock"}};
+                std::string limits;
+                for (const auto& [bit, name] : names) {
+                    if (window.reasons & bit) {
+                        limits += limits.empty() ? "" : ", ";
+                        limits += name;
+                    }
+                }
+                line += "; clock limited by: " + (limits.empty() ? std::string{"nothing"} : limits);
+            }
+        }
+        std::printf("%s\n", line.c_str());
+    }
+
+private:
+    void Reset() {
+        FILETIME creation, exit, kernel, user, idle, system_kernel, system_user;
+        if (GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user)) {
+            last_process = FileTime(kernel) + FileTime(user);
+        }
+        if (GetSystemTimes(&idle, &system_kernel, &system_user)) {
+            last_machine_total = FileTime(system_kernel) + FileTime(system_user);
+            last_machine_busy = last_machine_total - FileTime(idle);
+        }
+    }
+
+    void Sample() {
+        using SetDescriptionFn = HRESULT(WINAPI*)(HANDLE, PCWSTR);
+        if (const auto set_description = Load<SetDescriptionFn>(GetModuleHandleW(L"kernel32.dll"),
+                                                                "SetThreadDescription")) {
+            set_description(GetCurrentThread(), L"bb:PowerStats");
+        }
+        while (true) {
+            Window sample;
+            unsigned value = 0;
+            if (clock && clock(device, ClockGraphics, &value) == 0) {
+                sample.graphics_mhz = value;
+                sample.min_graphics_mhz = value;
+            }
+            if (clock && clock(device, ClockMemory, &value) == 0) {
+                sample.memory_mhz = value;
+            }
+            if (temperature && temperature(device, TemperatureGpu, &value) == 0) {
+                sample.max_temperature = value;
+            }
+            NvmlUtilization load{};
+            if (utilization && utilization(device, &load) == 0) {
+                sample.load = load.gpu;
+            }
+            unsigned long long limited = 0;
+            if (reasons && reasons(device, &limited) == 0) {
+                sample.reasons = limited & ~1ull; // not "idle"
+            }
+            const bool have_power = power && power(device, &value) == 0;
+            {
+                std::scoped_lock lock{mutex};
+                current.graphics_mhz += sample.graphics_mhz;
+                current.memory_mhz += sample.memory_mhz;
+                current.load += sample.load;
+                current.max_temperature = std::max(current.max_temperature, sample.max_temperature);
+                current.min_graphics_mhz =
+                    std::min(current.min_graphics_mhz, unsigned(sample.graphics_mhz));
+                current.reasons |= sample.reasons;
+                ++current.samples;
+                if (have_power) {
+                    current.power_mw += value;
+                    ++current.power_samples;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        }
+    }
+
+    bool enabled = false, gpu = false;
+    NvmlDevice device = nullptr;
+    UintFn power = nullptr, power_limit = nullptr;
+    ClockFn clock = nullptr;
+    TemperatureFn temperature = nullptr;
+    UtilizationFn utilization = nullptr;
+    ReasonsFn reasons = nullptr;
+    std::thread sampler;
+    std::mutex mutex;
+    Window current;
+    uint64_t last_process = 0, last_machine_busy = 0, last_machine_total = 0;
+};
+
+Monitor& Get() {
+    static Monitor* monitor = new Monitor; // lives until the process ends
+    return *monitor;
+}
+
+} // namespace
+
+void Start() {
+    Get();
+}
+
+void PrintWindow(double seconds) {
+    Get().Print(seconds);
+}
+
+} // namespace BbPower
+
+#else
+
+namespace BbPower {
+void Start() {}
+void PrintWindow(double) {}
+} // namespace BbPower
+
+#endif
