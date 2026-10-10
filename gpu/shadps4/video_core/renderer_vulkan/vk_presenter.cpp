@@ -35,6 +35,7 @@
 #include <memory>
 #include <span>
 #include <sstream>
+#include <string>
 #include <system_error>
 #include <vector>
 #include <vk_mem_alloc.h>
@@ -352,8 +353,129 @@ static void DumpRaw(const Instance& instance, Scheduler& scheduler, vk::CommandB
     });
 }
 
+// bbport: BB_FRAME_PICTURES=1 (diagnostics): the presented picture, at half size, as PPM files in
+// BB_DUMP_DIR: every 150 ms of the first three loading screens (no 3D scene; up to 40 each),
+// and every 100 ms for 4 s after F9. For glitches that come and go (what was on the screen).
+static void DumpPicture(const Instance& instance, Scheduler& scheduler, vk::CommandBuffer cmdbuf,
+                        vk::Image image, vk::Format format, u32 w, u32 h, std::string path) {
+    const VkBufferCreateInfo buffer_ci{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                       .size = VkDeviceSize(w) * h * 4,
+                                       .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    const VmaAllocationCreateInfo alloc_ci{
+        .flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST};
+    VkBuffer buffer{};
+    VmaAllocation allocation{};
+    VmaAllocationInfo info{};
+    if (vmaCreateBuffer(instance.GetAllocator(), &buffer_ci, &alloc_ci, &buffer, &allocation,
+                        &info) != VK_SUCCESS) {
+        return;
+    }
+    const vk::MemoryBarrier2 done{.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                                  .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                                  .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                                  .dstAccessMask = vk::AccessFlagBits2::eTransferRead};
+    cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &done});
+    cmdbuf.copyImageToBuffer(image, vk::ImageLayout::eGeneral, buffer,
+                             vk::BufferImageCopy{.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                                                 .imageExtent = {w, h, 1}});
+    const bool bgr = format == vk::Format::eB8G8R8A8Unorm || format == vk::Format::eB8G8R8A8Srgb;
+    scheduler.DeferPriorityOperation([allocator = instance.GetAllocator(), buffer, allocation, info,
+                                      w, h, bgr, path = std::move(path)] {
+        vmaInvalidateAllocation(allocator, allocation, 0, VK_WHOLE_SIZE);
+        const auto* pixels = static_cast<const u8*>(info.pMappedData);
+        const u32 ow = w / 2, oh = h / 2;
+        std::vector<u8> out(size_t(ow) * oh * 3);
+        for (u32 y = 0; y < oh; ++y) {
+            for (u32 x = 0; x < ow; ++x) {
+                for (u32 c = 0; c < 3; ++c) {
+                    const u32 channel = bgr ? 2 - c : c;
+                    u32 sum = 0;
+                    for (u32 dy = 0; dy < 2; ++dy) {
+                        for (u32 dx = 0; dx < 2; ++dx) {
+                            sum += pixels[(size_t(2 * y + dy) * w + 2 * x + dx) * 4 + channel];
+                        }
+                    }
+                    out[(size_t(y) * ow + x) * 3 + c] = u8(sum / 4);
+                }
+            }
+        }
+        if (FILE* f = std::fopen(path.c_str(), "wb")) {
+            std::fprintf(f, "P6\n%u %u\n255\n", ow, oh);
+            std::fwrite(out.data(), 1, out.size(), f);
+            std::fclose(f);
+        }
+        vmaDestroyBuffer(allocator, buffer, allocation);
+    });
+}
+
+namespace {
+/// Which presented frames BB_FRAME_PICTURES saves (GPU command thread only).
+struct PictureSchedule {
+    bool enabled = [] {
+        const char* env = std::getenv("BB_FRAME_PICTURES");
+        return env && env[0] == '1';
+    }();
+    std::chrono::steady_clock::time_point series_start{}, last{};
+    std::chrono::milliseconds every{150};
+    u32 series = 0, taken = 0, limit = 0, loading_series = 0;
+    bool loading = false, active = false;
+    char kind[16] = {};
+
+    /// The file name for this frame, or empty.
+    std::string Next() {
+        if (!enabled) return {};
+        const auto now = std::chrono::steady_clock::now();
+        const bool loading_now = BbStats::loading_screen.load(std::memory_order_relaxed);
+        if (BbStats::frame_burst_request.exchange(false, std::memory_order_relaxed)) {
+            Start(now, "f9", std::chrono::milliseconds(100), 40);
+        } else if (loading_now && !loading && loading_series < 3 &&
+                   !(active && kind[0] == 'f')) {
+            ++loading_series;
+            Start(now, "loading", std::chrono::milliseconds(150), 40);
+        }
+        loading = loading_now;
+        if (active && kind[0] == 'l' && !loading_now) {
+            Finish();
+        }
+        if (!active || now - last < every) return {};
+        last = now;
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - series_start);
+        const char* dir = std::getenv("BB_DUMP_DIR");
+        char path[512];
+        std::snprintf(path, sizeof(path), "%s/%s%u_%02u_%05lldms.ppm", dir && *dir ? dir : ".",
+                      kind, series, taken, static_cast<long long>(ms.count()));
+        if (++taken >= limit) {
+            Finish();
+        }
+        return path;
+    }
+
+    void Start(std::chrono::steady_clock::time_point now, const char* name,
+               std::chrono::milliseconds period, u32 count) {
+        if (active) Finish();
+        std::snprintf(kind, sizeof(kind), "%s", name);
+        ++series;
+        series_start = now;
+        last = now - period;
+        every = period;
+        taken = 0;
+        limit = count;
+        active = true;
+        std::printf("Pictures: series %u (%s) started\n", series, kind);
+    }
+
+    void Finish() {
+        active = false;
+        std::printf("Pictures: series %u (%s): %u pictures\n", series, kind, taken);
+    }
+};
+} // namespace
+
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                VAddr cpu_address) {
+    static PictureSchedule pictures;
+    const std::string picture = pictures.Next();
     // bbport: BB_FRAME_DUMP_TRIGGER=<file>: when the file exists it is removed and this frame's
     // guest display buffer and presented image are written to BB_DUMP_DIR (default out/dump)
     // as raw 32-bit pixels (menus and movies included; the upscaler dumps scene frames only).
@@ -455,6 +577,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     pp_settings.srgb_input =
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
     pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
+    if (!picture.empty()) {
+        DumpPicture(instance, draw_scheduler, cmdbuf, frame->image,
+                    swapchain.GetSurfaceFormat().format, frame->width, frame->height, picture);
+    }
     if (frame_dump) {
         // The presented image as the swapchain blit reads it (General after the pass).
         const vk::MemoryBarrier2 done{.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,

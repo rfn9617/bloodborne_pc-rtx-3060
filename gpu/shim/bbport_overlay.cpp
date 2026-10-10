@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "bbport_overlay.h"
+#include "bbport_toggles.h"
 
 #include <atomic>
 #include <cfloat>
@@ -591,6 +592,12 @@ bool HandleEvent(const SDL_Event& event) {
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP: {
         const bool down = event.type == SDL_EVENT_KEY_DOWN;
+        // bbport: F9 saves the next seconds of the picture (BB_FRAME_PICTURES, diagnostics).
+        if (down && !event.key.repeat && event.key.key == SDLK_F9 &&
+            std::getenv("BB_FRAME_PICTURES")) {
+            BbStats::frame_burst_request.store(true, std::memory_order_relaxed);
+            return true;
+        }
         if (down && !event.key.repeat &&
             (event.key.key == SDLK_INSERT || (is_open && event.key.key == SDLK_ESCAPE))) {
             SetOpen(event.key.key == SDLK_INSERT ? !is_open : false);

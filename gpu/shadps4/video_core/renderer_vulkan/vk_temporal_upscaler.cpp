@@ -2137,13 +2137,15 @@ bool TemporalUpscaler::RecordDlss(vk::CommandBuffer cmdbuf, const Dlss::Resource
 }
 
 void TemporalUpscaler::TrackLoadingScreen() {
-    // Loading screens: no 3D scene for a while (also the title menu). They may go without the
-    // frame limit (BB_FAST_LOADING: 1 always; 2 to compare: two loading screens with the limit,
-    // two without, and so on, so that trips back and forth get both), and BB_FRAME_STATS
+    // Loading screens: no 3D scene for a while (also the title menu). They go without the
+    // frame limit: the game advances its loading per frame, and on 2026-10-10 a Hunter's Dream
+    // load took 1.32 s instead of 1.72 s, an area load 2.54 s instead of 3.03 s.
+    // BB_FAST_LOADING: 1 (default) always, 0 never, 2 to compare (two loading screens with the
+    // limit, two without, and so on, so that trips back and forth get both). BB_FRAME_STATS
     // prints how long each one took and what the game read meanwhile.
     static const int fast_loading = [] {
         const char* env = std::getenv("BB_FAST_LOADING");
-        return env ? std::atoi(env) : 0;
+        return env && env[0] ? std::atoi(env) : 1;
     }();
     const bool scene = scene_color || camera_motion.Depth();
     if (!scene) {

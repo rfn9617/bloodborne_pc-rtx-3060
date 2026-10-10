@@ -123,6 +123,8 @@ inline std::atomic<std::uint64_t> barrier_calls{0}, barrier_images{0};
 /// The game shows no 3D scene for a while (loading screens, title menu): the CPU sampler's
 /// BB_CPU_SAMPLE=3 records only then.
 inline std::atomic<bool> loading_screen{false};
+/// F9: save the next few seconds of presented frames as pictures (Presenter::PrepareFrame).
+inline std::atomic<bool> frame_burst_request{false};
 /// This loading screen goes without the frame limit (BB_FAST_LOADING, the present thread).
 inline std::atomic<bool> loading_unlimited{false};
 /// Render pass instances begun (Scheduler::BeginRendering).
