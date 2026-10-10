@@ -14,6 +14,7 @@
 #include <limits.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <time.h>
 #include <sys/stat.h>
 #ifdef _WIN32
 #include <windows.h>
@@ -294,11 +295,29 @@ static void touch_for_write(void *buffer,uint64_t size) {
         *b=*b;
     }
 }
+/* Statistics for BB_FRAME_STATS (gpu/shim/bbport_power.cpp): time in the host read calls and
+ * in touching the destination pages first (faults on GPU-tracked pages land there). */
+static uint64_t read_ns, touch_ns;
+static uint64_t file_now_ns(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
+    return (uint64_t)t.tv_sec*1000000000u+(uint64_t)t.tv_nsec;
+}
+void runtime_file_stats(uint64_t out[5]) {
+    out[0]=__atomic_load_n(&opens,__ATOMIC_RELAXED);
+    out[1]=__atomic_load_n(&reads,__ATOMIC_RELAXED);
+    out[2]=__atomic_load_n(&bytes_read,__ATOMIC_RELAXED);
+    out[3]=__atomic_load_n(&read_ns,__ATOMIC_RELAXED);
+    out[4]=__atomic_load_n(&touch_ns,__ATOMIC_RELAXED);
+}
 static int64_t do_read(int fd,void *buffer,uint64_t size) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
+    const uint64_t t0=file_now_ns();
     touch_for_write(buffer,size);
+    const uint64_t t1=file_now_ns();
     ssize_t n=host_read(h,buffer,size);
+    __atomic_add_fetch(&touch_ns,t1-t0,__ATOMIC_RELAXED);
+    __atomic_add_fetch(&read_ns,file_now_ns()-t1,__ATOMIC_RELAXED);
     if (n<0) { if (audio_trace()) printf("Audio trace: read(fd %d, %llu) failed, errno %d\n",fd,(unsigned long long)size,errno); return -errno; }
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;
@@ -306,8 +325,12 @@ static int64_t do_read(int fd,void *buffer,uint64_t size) {
 static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
+    const uint64_t t0=file_now_ns();
     touch_for_write(buffer,size);
+    const uint64_t t1=file_now_ns();
     ssize_t n=pread(h,buffer,size,offset);
+    __atomic_add_fetch(&touch_ns,t1-t0,__ATOMIC_RELAXED);
+    __atomic_add_fetch(&read_ns,file_now_ns()-t1,__ATOMIC_RELAXED);
     if (n<0) { if (audio_trace()) printf("Audio trace: pread(fd %d, %llu @%lld) failed, errno %d\n",fd,(unsigned long long)size,(long long)offset,errno); return -errno; }
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;

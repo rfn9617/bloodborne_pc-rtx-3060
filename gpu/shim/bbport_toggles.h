@@ -102,6 +102,8 @@ inline std::atomic<std::uint64_t> camera_snapshots{0}, camera_guest_changed{0};
 inline std::atomic<std::uint64_t> t_resident{0}, t_protect{0}, t_image_create{0}, t_refresh{0},
     t_staging{0}, t_host_wait{0}, t_copy{0}, copy_bytes{0}, t_read_faults{0}, read_faults{0},
     t_write_faults{0}, t_copy_cpu{0}, copy_sys_us{0}, copy_minflt{0};
+/// Pipeline barriers recorded (Runtime::FlushBarriers) and the image barriers in them.
+inline std::atomic<std::uint64_t> barrier_calls{0}, barrier_images{0};
 /// Diagnostics are collected only with BB_FRAME_STATS=1.
 inline const bool enabled = [] {
     const char* env = std::getenv("BB_FRAME_STATS");

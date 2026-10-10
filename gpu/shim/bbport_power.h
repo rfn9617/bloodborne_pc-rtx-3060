@@ -9,7 +9,8 @@ namespace BbPower {
 /// Starts the sampling (call once at startup; BB_FRAME_STATS=1 only).
 void Start();
 
-/// Prints the averages since the previous call (no-op without BB_FRAME_STATS or elsewhere).
-void PrintWindow(double seconds);
+/// Prints the averages since the previous call over `frames` frames (no-op without
+/// BB_FRAME_STATS).
+void PrintWindow(double seconds, unsigned frames);
 
 } // namespace BbPower

@@ -475,7 +475,7 @@ void VideoOutDriver::Flip(const Request& req) {
                             median, std::sqrt(std::max(0.0, sq / intervals.size() - mean * mean)),
                             sorted[std::min(sorted.size() - 1, sorted.size() * 99 / 100)], spikes);
             }
-            BbPower::PrintWindow(window);
+            BbPower::PrintWindow(window, frames);
             intervals.clear();
             window_start = now;
             frames = 0;

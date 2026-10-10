@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // bbport: see bbport_power.h.
 #include "bbport_power.h"
+#include "bbport_toggles.h"
 
 #ifdef _WIN32
 
@@ -15,6 +16,8 @@
 #include <mutex>
 #include <string>
 #include <thread>
+
+extern "C" void runtime_file_stats(uint64_t out[5]);
 
 namespace BbPower {
 
@@ -88,7 +91,7 @@ public:
         Reset();
     }
 
-    void Print(double seconds) {
+    void Print(double seconds, unsigned frames) {
         if (!enabled) {
             return;
         }
@@ -160,7 +163,33 @@ public:
                 line += "; clock limited by: " + (limits.empty() ? std::string{"nothing"} : limits);
             }
         }
-        std::printf("%s\n", line.c_str());
+        // Guest file reads (runtime_file.c): loading screens and streaming.
+        uint64_t files[5] = {};
+        runtime_file_stats(files);
+        if (files[1] != last_files[1]) {
+            std::snprintf(buffer, sizeof(buffer),
+                          "; files: %llu opened, %llu reads, %.1f MB, %.0f ms reading, %.0f ms "
+                          "touching pages",
+                          static_cast<unsigned long long>(files[0] - last_files[0]),
+                          static_cast<unsigned long long>(files[1] - last_files[1]),
+                          (files[2] - last_files[2]) / 1e6, (files[3] - last_files[3]) / 1e6,
+                          (files[4] - last_files[4]) / 1e6);
+            line += buffer;
+        }
+        std::copy(std::begin(files), std::end(files), std::begin(last_files));
+        const uint64_t calls = BbStats::barrier_calls.load(std::memory_order_relaxed);
+        const uint64_t images = BbStats::barrier_images.load(std::memory_order_relaxed);
+        if (frames) {
+            std::snprintf(buffer, sizeof(buffer), "; barriers %.0f/frame (%.0f image barriers)",
+                          double(calls - last_barriers) / frames,
+                          double(images - last_image_barriers) / frames);
+            line += buffer;
+        }
+        last_barriers = calls;
+        last_image_barriers = images;
+        const double since_start =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        std::printf("Power: t=%.0f s; %s\n", since_start, line.c_str() + 7);
     }
 
 private:
@@ -233,6 +262,8 @@ private:
     std::mutex mutex;
     Window current;
     uint64_t last_process = 0, last_machine_busy = 0, last_machine_total = 0;
+    uint64_t last_files[5] = {}, last_barriers = 0, last_image_barriers = 0;
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
 };
 
 Monitor& Get() {
@@ -246,8 +277,8 @@ void Start() {
     Get();
 }
 
-void PrintWindow(double seconds) {
-    Get().Print(seconds);
+void PrintWindow(double seconds, unsigned frames) {
+    Get().Print(seconds, frames);
 }
 
 } // namespace BbPower
@@ -256,7 +287,7 @@ void PrintWindow(double seconds) {
 
 namespace BbPower {
 void Start() {}
-void PrintWindow(double) {}
+void PrintWindow(double, unsigned) {}
 } // namespace BbPower
 
 #endif
