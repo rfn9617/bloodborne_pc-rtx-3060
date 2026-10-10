@@ -2954,12 +2954,21 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
                                     ? vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal
                                 : has_stencil ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
                                               : vk::ImageLayout::eDepthReadOnlyOptimal;
+        // bbport: in a read-only layout without clears the attachment is only read, so sampling
+        // the same depth before or after needs no barrier (Image::GetBarriers merges two reads).
+        const bool read_only =
+            (new_layout == vk::ImageLayout::eDepthStencilReadOnlyOptimal ||
+             new_layout == vk::ImageLayout::eDepthReadOnlyOptimal) &&
+            !is_depth_clear && !is_stencil_clear &&
+            !BbToggle::Disabled(BbToggle::High::ReadAfterReadBarriers);
+        const auto depth_access =
+            read_only ? vk::AccessFlagBits2::eDepthStencilAttachmentRead
+                      : vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+                            vk::AccessFlagBits2::eDepthStencilAttachmentRead;
         if (!reduced) needs_barrier |= runtime.Transit(&image, new_layout,
                                          vk::PipelineStageFlagBits2::eEarlyFragmentTests |
                                              vk::PipelineStageFlagBits2::eLateFragmentTests,
-                                         vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
-                                             vk::AccessFlagBits2::eDepthStencilAttachmentRead,
-                                         desc.view_info.range);
+                                         depth_access, desc.view_info.range);
 
         state.width = std::min<u32>(state.width, image.info.size.width);
         state.height = std::min<u32>(state.height, image.info.size.height);
