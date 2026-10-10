@@ -16,6 +16,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 extern "C" void runtime_file_stats(uint64_t out[5]);
 
@@ -179,20 +180,70 @@ public:
         std::copy(std::begin(files), std::end(files), std::begin(last_files));
         const uint64_t calls = BbStats::barrier_calls.load(std::memory_order_relaxed);
         const uint64_t images = BbStats::barrier_images.load(std::memory_order_relaxed);
+        const uint64_t passes = BbStats::render_passes.load(std::memory_order_relaxed);
+        const uint64_t skipped = BbStats::read_after_read_skipped.load(std::memory_order_relaxed);
         if (frames) {
-            std::snprintf(buffer, sizeof(buffer), "; barriers %.0f/frame (%.0f image barriers)",
+            std::snprintf(buffer, sizeof(buffer),
+                          "; barriers %.0f/frame (%.0f image barriers, %.1f read-after-read "
+                          "left out); render passes %.0f/frame",
                           double(calls - last_barriers) / frames,
-                          double(images - last_image_barriers) / frames);
+                          double(images - last_image_barriers) / frames,
+                          double(skipped - last_skipped) / frames,
+                          double(passes - last_passes) / frames);
             line += buffer;
         }
         last_barriers = calls;
         last_image_barriers = images;
+        last_passes = passes;
+        last_skipped = skipped;
         const double since_start =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         std::printf("Power: t=%.0f s; %s\n", since_start, line.c_str() + 7);
+        PrintBarrierKinds(frames);
     }
 
 private:
+    /// The most frequent image barriers since the last window: old -> new layout.
+    void PrintBarrierKinds(unsigned frames) {
+        struct Kind {
+            uint64_t count;
+            unsigned from, to, after_write;
+        };
+        std::vector<Kind> kinds;
+        uint64_t total = 0;
+        for (unsigned from = 0; from < BbStats::NumLayoutKinds; ++from) {
+            for (unsigned to = 0; to < BbStats::NumLayoutKinds; ++to) {
+                for (unsigned write = 0; write < 2; ++write) {
+                    const uint64_t now = BbStats::image_barrier_kinds[from][to][write].load(
+                        std::memory_order_relaxed);
+                    uint64_t& last = last_kinds[from][to][write];
+                    if (now != last) {
+                        kinds.push_back({now - last, from, to, write});
+                        total += now - last;
+                    }
+                    last = now;
+                }
+            }
+        }
+        if (!frames || kinds.empty()) {
+            return;
+        }
+        std::sort(kinds.begin(), kinds.end(),
+                  [](const Kind& a, const Kind& b) { return a.count > b.count; });
+        std::string line = "Image barriers by layout (per frame):";
+        char buffer[160];
+        for (size_t i = 0; i < kinds.size() && i < 10; ++i) {
+            const Kind& kind = kinds[i];
+            std::snprintf(buffer, sizeof(buffer), "%s %s -> %s%s %.1f", i ? ";" : "",
+                          BbStats::LayoutNames[kind.from], BbStats::LayoutNames[kind.to],
+                          kind.after_write ? " after write" : "", double(kind.count) / frames);
+            line += buffer;
+        }
+        std::snprintf(buffer, sizeof(buffer), "; all %.1f", double(total) / frames);
+        line += buffer;
+        std::printf("%s\n", line.c_str());
+    }
+
     void Reset() {
         FILETIME creation, exit, kernel, user, idle, system_kernel, system_user;
         if (GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user)) {
@@ -262,7 +313,9 @@ private:
     std::mutex mutex;
     Window current;
     uint64_t last_process = 0, last_machine_busy = 0, last_machine_total = 0;
-    uint64_t last_files[5] = {}, last_barriers = 0, last_image_barriers = 0;
+    uint64_t last_files[5] = {}, last_barriers = 0, last_image_barriers = 0, last_passes = 0,
+             last_skipped = 0;
+    uint64_t last_kinds[BbStats::NumLayoutKinds][BbStats::NumLayoutKinds][2] = {};
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
 };
 

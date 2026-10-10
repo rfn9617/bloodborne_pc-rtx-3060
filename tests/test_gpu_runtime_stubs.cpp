@@ -14,6 +14,8 @@ int runtime_test_write_fail = 0;
 uint64_t runtime_test_write_calls = 0;
 __thread sigjmp_buf* runtime_fault_recover = nullptr;
 uint64_t runtime_disabled_optimizations = 0;
+uint64_t runtime_disabled_optimizations_high = 0;
+unsigned runtime_toggle_phase = 0;
 #ifdef _WIN32
 int bb_setjmp(sigjmp_buf) { std::abort(); }
 #endif

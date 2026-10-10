@@ -694,20 +694,31 @@ void *runtime_low_map(size_t size, int prot) {
  * 262144 with BB_ASYNC_FENCES=1: wait for guest copies at fences again,
  * 524288 small guest copies batched for the copy threads instead of the recording thread,
  * 1073741824 the lock-free UpdateImage path for clean, tracked images. */
-/* Bits 32 and up: the draw pipeline and related GPU thread work (gpu/shim/bbport_toggles.h). */
-uint64_t runtime_disabled_optimizations;
+/* Bits 32 and up: the draw pipeline and related GPU thread work (gpu/shim/bbport_toggles.h).
+ * A second word holds bits 64 and up (BbToggle::High): the file holds "<low> <high>", the
+ * masks of BB_TOGGLE_AB "<low>+<high>". */
+uint64_t runtime_disabled_optimizations, runtime_disabled_optimizations_high;
+/* The current BB_TOGGLE_AB phase plus one, 0 without BB_TOGGLE_AB (settings per phase:
+ * BB_PHASE_SETTINGS, gpu/shim/bbport_settings.cpp). */
+unsigned runtime_toggle_phase;
 /* Speculative readers of guest memory (GPU draw-preparation workers) register a recovery
  * point: a fault on that thread jumps back to it instead of terminating (probe.c). */
 __thread sigjmp_buf *runtime_fault_recover;
 static void *toggle_watcher(void *path) {
-    for (unsigned long long last=ULLONG_MAX;;) {
+    for (unsigned long long last=ULLONG_MAX, last_high=ULLONG_MAX;;) {
         FILE *f=fopen(path,"r");
-        unsigned long long value=0;
-        if (f) { if (fscanf(f,"%llu",&value)!=1) value=0; fclose(f); }
-        if (value!=last) {
+        unsigned long long value=0, high=0;
+        if (f) {
+            if (fscanf(f,"%llu",&value)!=1) value=0;
+            else if (fscanf(f,"%llu",&high)!=1) high=0;
+            fclose(f);
+        }
+        if (value!=last || high!=last_high) {
+            __atomic_store_n(&runtime_disabled_optimizations_high,(uint64_t)high,__ATOMIC_RELEASE);
             __atomic_store_n(&runtime_disabled_optimizations,(uint64_t)value,__ATOMIC_RELEASE);
-            printf("Runtime: disabled optimizations mask=%llu\n",value);
+            printf("Runtime: disabled optimizations mask=%llu high=%llu\n",value,high);
             last=value;
+            last_high=high;
         }
 #ifdef _WIN32
         compat_sleep_ns(250000000);
@@ -720,25 +731,35 @@ static void *toggle_watcher(void *path) {
 /* BB_TOGGLE_AB=<seconds>:<mask>,<mask>,...: an A/B in one run without editing a file. The
  * masks take turns, each for <seconds>, from the first again after the last; every switch is
  * printed, so the 5 s statistics windows of BB_FRAME_STATS can be attributed to a phase.
+ * A mask is "<low>" or "<low>+<high>" (bits 64 and up in <high>).
  * Example: 20:0,4323455642275676160 alternates everything on with bits 58-61 off. */
 static void *toggle_alternator(void *spec) {
     char *end=NULL;
     unsigned long seconds=strtoul(spec,&end,10);
-    unsigned long long masks[16];
+    unsigned long long masks[16], highs[16];
     unsigned count=0;
     if (seconds==0 || !end || *end!=':') return NULL;
     for (const char *at=end+1; *at && count<16; ) {
-        masks[count++]=strtoull(at,&end,10);
-        if (end==at) { --count; break; }
+        masks[count]=strtoull(at,&end,10);
+        if (end==at) break;
+        highs[count]=0;
+        if (*end=='+') {
+            const char *high=end+1;
+            highs[count]=strtoull(high,&end,10);
+            if (end==high) break;
+        }
+        ++count;
         at=*end==',' ? end+1 : end;
         if (!*end) break;
     }
     if (!count) return NULL;
     for (unsigned long long cycle=0;;++cycle) {
         for (unsigned phase=0; phase<count; ++phase) {
+            __atomic_store_n(&runtime_disabled_optimizations_high,(uint64_t)highs[phase],__ATOMIC_RELEASE);
             __atomic_store_n(&runtime_disabled_optimizations,(uint64_t)masks[phase],__ATOMIC_RELEASE);
-            printf("Runtime: A/B phase %u of %u (cycle %llu), disabled optimizations mask=%llu\n",
-                   phase+1,count,cycle+1,masks[phase]);
+            __atomic_store_n(&runtime_toggle_phase,phase+1,__ATOMIC_RELEASE);
+            printf("Runtime: A/B phase %u of %u (cycle %llu), disabled optimizations mask=%llu "
+                   "high=%llu\n",phase+1,count,cycle+1,masks[phase],highs[phase]);
             fflush(stdout);
 #ifdef _WIN32
             for (unsigned long i=0;i<seconds*4;++i) compat_sleep_ns(250000000);

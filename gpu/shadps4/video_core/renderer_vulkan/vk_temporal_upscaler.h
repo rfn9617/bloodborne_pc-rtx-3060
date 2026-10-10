@@ -185,6 +185,11 @@ private:
     /// Sharpness above 1 for FSR 3/4 (their RCAS stops at 1): one more RCAS pass over the target
     /// (output_image, or the 8-bit UI image with ldr) in General layout after the upscaler.
     void ExtraSharpen(vk::CommandBuffer cmdbuf, vk::Image target, bool ldr, u32 w, u32 h);
+    /// DLSS/FSR 4 with extra sharpening: RCAS from output_image straight into the UI image (one
+    /// pass for ExtraSharpen's copy, RCAS and the blit). False when it does not apply.
+    bool SharpenToUi(vk::CommandBuffer cmdbuf, u32 w, u32 h);
+    /// The UI image through a UNORM view for compute writes (its own format may be sRGB).
+    vk::ImageView UiStorageView();
 
     const Instance& instance;
     Scheduler& scheduler;
@@ -284,6 +289,7 @@ private:
     vk::UniquePipelineLayout taa_sharpen_pipeline_layout;
     vk::UniquePipeline taa_sharpen_pipeline;
     vk::UniquePipeline taa_sharpen_ldr_pipeline;
+    vk::UniquePipeline taa_sharpen_ldr_half_pipeline; ///< RGBA16F in, UI image out
     // ExtraSharpen: a copy of the upscaled frame (RCAS reads neighbours) and the target views.
     VideoCore::UniqueImage extra_sharpen_image;
     vk::UniqueImageView extra_sharpen_view;

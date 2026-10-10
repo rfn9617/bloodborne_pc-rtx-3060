@@ -14,7 +14,9 @@ extern "C" __attribute__((returns_twice)) int bb_setjmp(sigjmp_buf buffer);
 #define sigsetjmp(buffer, save) bb_setjmp(buffer)
 #endif
 
-extern "C" std::uint64_t runtime_disabled_optimizations;
+extern "C" std::uint64_t runtime_disabled_optimizations, runtime_disabled_optimizations_high;
+/// The current BB_TOGGLE_AB phase plus one, 0 without it (runtime_memory.c).
+extern "C" unsigned runtime_toggle_phase;
 /// Recovery point for speculative guest memory reads on this thread (runtime_memory.c).
 extern "C" __thread sigjmp_buf* runtime_fault_recover;
 
@@ -83,6 +85,20 @@ enum : std::uint64_t {
 inline bool Disabled(std::uint64_t bit) {
     return (__atomic_load_n(&runtime_disabled_optimizations, __ATOMIC_RELAXED) & bit) != 0;
 }
+/// Bits 64 and up: the second number of BB_TOGGLE_FILE, "<low>+<high>" masks in BB_TOGGLE_AB.
+enum class High : std::uint64_t {
+    /// RunScaled with DLSS/FSR 4 and extra sharpening: one RCAS pass from the upscaler's output
+    /// straight into the UI image, instead of a copy, RCAS in place and a blit.
+    MergedUpscalerOutput = 1ull << 0, // 64
+    /// No image barrier between two reads in the same layout (only the stages are merged).
+    ReadAfterReadBarriers = 1ull << 1, // 65
+    /// The GPU command thread waits as BB_FRAMES_AHEAD says; off: one frame more ahead.
+    FramesAheadAsSet = 1ull << 2, // 66
+};
+inline bool Disabled(High bit) {
+    return (__atomic_load_n(&runtime_disabled_optimizations_high, __ATOMIC_RELAXED) &
+            static_cast<std::uint64_t>(bit)) != 0;
+}
 } // namespace BbToggle
 
 namespace BbStats {
@@ -104,6 +120,31 @@ inline std::atomic<std::uint64_t> t_resident{0}, t_protect{0}, t_image_create{0}
     t_write_faults{0}, t_copy_cpu{0}, copy_sys_us{0}, copy_minflt{0};
 /// Pipeline barriers recorded (Runtime::FlushBarriers) and the image barriers in them.
 inline std::atomic<std::uint64_t> barrier_calls{0}, barrier_images{0};
+/// Render pass instances begun (Scheduler::BeginRendering).
+inline std::atomic<std::uint64_t> render_passes{0};
+/// Image barriers made by Image::GetBarriers by old and new layout (LayoutIndex) and whether
+/// the old access wrote; read-after-read barriers left out (BbToggle::High::ReadAfterReadBarriers).
+inline constexpr unsigned NumLayoutKinds = 16;
+inline std::atomic<std::uint64_t> image_barrier_kinds[NumLayoutKinds][NumLayoutKinds][2];
+inline std::atomic<std::uint64_t> read_after_read_skipped{0};
+inline constexpr const char* LayoutNames[NumLayoutKinds] = {
+    "undefined", "general", "color", "depth-stencil", "depth-stencil read-only", "shader read",
+    "transfer src", "transfer dst", "depth read-only/stencil", "depth/stencil read-only",
+    "depth", "depth read-only", "feedback loop", "present", "other", "?"};
+/// VkImageLayout -> LayoutNames index.
+inline unsigned LayoutIndex(int layout) {
+    switch (layout) {
+    case 0: case 1: case 2: case 3: case 4: case 5: case 6: case 7:
+        return unsigned(layout);
+    case 1000117000: return 8;  // DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL
+    case 1000117001: return 9;  // DEPTH_ATTACHMENT_STENCIL_READ_ONLY_OPTIMAL
+    case 1000241000: return 10; // DEPTH_ATTACHMENT_OPTIMAL
+    case 1000241001: return 11; // DEPTH_READ_ONLY_OPTIMAL
+    case 1000339000: return 12; // ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+    case 1000001002: return 13; // PRESENT_SRC_KHR
+    default: return 14;
+    }
+}
 /// Diagnostics are collected only with BB_FRAME_STATS=1.
 inline const bool enabled = [] {
     const char* env = std::getenv("BB_FRAME_STATS");

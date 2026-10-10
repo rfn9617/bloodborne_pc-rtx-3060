@@ -124,6 +124,10 @@ int RenderPreset();
 bool ResolutionNeedsRestart();
 /// Writes the file (menu changes).
 void Save();
+/// BB_PHASE_SETTINGS=<settings>/<settings>/...: ini settings ("key=value,key=value") for the
+/// phases of BB_TOGGLE_AB, the n-th list in its n-th phase (`phase`, 1-based; 0 = none). Applied
+/// once per phase change, not saved. Called every frame.
+void ApplyPhaseSettings(unsigned phase);
 
 /// Render resolution divisor of a preset (1.0 native, 1.5 quality, ...).
 float PresetScale(int preset);

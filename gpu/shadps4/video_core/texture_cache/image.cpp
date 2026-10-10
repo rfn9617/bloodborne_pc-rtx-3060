@@ -239,6 +239,42 @@ ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_sam
     return (*slot_image_views)[view_id];
 }
 
+namespace {
+// Every access that writes, attachments included (the checks below keep the original
+// transfer/shader/memory-only test for whether a same-access barrier is needed).
+constexpr auto AnyWrite =
+    vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eShaderWrite |
+    vk::AccessFlagBits2::eShaderStorageWrite | vk::AccessFlagBits2::eMemoryWrite |
+    vk::AccessFlagBits2::eColorAttachmentWrite | vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+    vk::AccessFlagBits2::eHostWrite;
+
+/// bbport: two reads in the same layout need no barrier; the state keeps both readers so
+/// that the next write waits for all of them.
+bool MergeReadAfterRead(Image::State& state, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
+                        vk::PipelineStageFlags2 dst_stage) {
+    if (state.layout != dst_layout || (state.access_mask & AnyWrite) || (dst_mask & AnyWrite) ||
+        !dst_mask || !state.access_mask ||
+        BbToggle::Disabled(BbToggle::High::ReadAfterReadBarriers)) {
+        return false;
+    }
+    state.access_mask |= dst_mask;
+    state.pl_stage |= dst_stage;
+    if (BbStats::enabled) {
+        BbStats::read_after_read_skipped.fetch_add(1, std::memory_order_relaxed);
+    }
+    return true;
+}
+
+void CountBarrier(const Image::State& state, vk::ImageLayout dst_layout) {
+    if (BbStats::enabled) {
+        BbStats::image_barrier_kinds[BbStats::LayoutIndex(int(state.layout))]
+                                    [BbStats::LayoutIndex(int(dst_layout))]
+                                    [(state.access_mask & AnyWrite) ? 1 : 0]
+                                        .fetch_add(1, std::memory_order_relaxed);
+    }
+}
+} // namespace
+
 void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                         vk::PipelineStageFlags2 dst_stage,
                         std::optional<SubresourceRange> subres_range) {
@@ -249,6 +285,9 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
         subres_range &&
         (subres_range->base != SubresourceBase{} || subres_range->extent != info.resources);
     const bool partially_transited = !subresource_states.empty();
+    // Readers merged instead of a barrier (MergeReadAfterRead), kept in the whole-image state.
+    vk::PipelineStageFlags2 merged_stages{};
+    vk::AccessFlags2 merged_access{};
 
     if (needs_partial_transition || partially_transited) {
         if (!partially_transited) {
@@ -282,7 +321,13 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
                                              vk::AccessFlagBits2::eShaderWrite |
                                              vk::AccessFlagBits2::eMemoryWrite;
                 const bool is_write = static_cast<bool>(state.access_mask & write_flags);
-                if (state.layout != dst_layout || state.access_mask != dst_mask || is_write) {
+                const bool needed =
+                    state.layout != dst_layout || state.access_mask != dst_mask || is_write;
+                if (needed && MergeReadAfterRead(state, dst_layout, dst_mask, dst_stage)) {
+                    merged_stages |= state.pl_stage;
+                    merged_access |= state.access_mask;
+                } else if (needed) {
+                    CountBarrier(state, dst_layout);
                     barriers.emplace_back(vk::ImageMemoryBarrier2{
                         .srcStageMask = state.pl_stage,
                         .srcAccessMask = state.access_mask,
@@ -319,6 +364,10 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
         if (last_state.layout == dst_layout && last_state.access_mask == dst_mask && !is_write) {
             return;
         }
+        if (MergeReadAfterRead(last_state, dst_layout, dst_mask, dst_stage)) {
+            return;
+        }
+        CountBarrier(last_state, dst_layout);
 
         barriers.emplace_back(vk::ImageMemoryBarrier2{
             .srcStageMask = last_state.pl_stage,
@@ -341,8 +390,8 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
     }
 
     last_state.layout = dst_layout;
-    last_state.access_mask = dst_mask;
-    last_state.pl_stage = dst_stage;
+    last_state.access_mask = dst_mask | merged_access;
+    last_state.pl_stage = dst_stage | merged_stages;
 }
 
 } // namespace VideoCore

@@ -7,6 +7,8 @@
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace BbSettings {
 
@@ -82,6 +84,52 @@ void Set(Values& v, const std::string& key, const std::string& value) {
 }
 
 } // namespace
+
+void ApplyPhaseSettings(unsigned phase) {
+    // "key=value,key=value/key=value,..." -> one list of ini settings per phase.
+    using Phase = std::vector<std::pair<std::string, std::string>>;
+    static const std::vector<Phase> phases = [] {
+        std::vector<Phase> result;
+        const char* env = std::getenv("BB_PHASE_SETTINGS");
+        if (!env || !env[0]) {
+            return result;
+        }
+        std::string_view rest{env};
+        while (true) {
+            const size_t slash = rest.find('/');
+            std::string_view phase_text = rest.substr(0, slash);
+            Phase settings;
+            while (!phase_text.empty()) {
+                const size_t comma = phase_text.find(',');
+                const std::string_view item = phase_text.substr(0, comma);
+                if (const size_t equals = item.find('='); equals != std::string_view::npos) {
+                    settings.emplace_back(std::string{item.substr(0, equals)},
+                                          std::string{item.substr(equals + 1)});
+                }
+                phase_text = comma == std::string_view::npos ? std::string_view{}
+                                                             : phase_text.substr(comma + 1);
+            }
+            result.push_back(std::move(settings));
+            if (slash == std::string_view::npos) {
+                break;
+            }
+            rest = rest.substr(slash + 1);
+        }
+        return result;
+    }();
+    static unsigned applied = 0;
+    if (phases.empty() || phase == 0 || phase == applied) {
+        return;
+    }
+    applied = phase;
+    std::string text;
+    for (const auto& [key, value] : phases[(phase - 1) % phases.size()]) {
+        Set(Get(), key, value);
+        text += (text.empty() ? "" : ", ") + key + "=" + value;
+    }
+    std::printf("Settings: A/B phase %u: %s\n", phase, text.empty() ? "(unchanged)" : text.c_str());
+    std::fflush(stdout);
+}
 
 Values& Get() {
     static Values values;

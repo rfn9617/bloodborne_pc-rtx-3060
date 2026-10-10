@@ -13,6 +13,7 @@
 #include "common/assert.h"
 #include "bbport_toggles.h"
 #include "bbport_power.h"
+#include "bbport_settings.h"
 #include "bbport_vblank_clock.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
@@ -300,6 +301,8 @@ void VideoOutDriver::Flip(const Request& req) {
     });
     Vulkan::FrameCapture::OnFlip(req.index >= 0 ? req.port->buffer_slots[req.index].address_left
                                                 : 0);
+    // bbport: settings of the current BB_TOGGLE_AB phase (BB_PHASE_SETTINGS).
+    BbSettings::ApplyPhaseSettings(__atomic_load_n(&runtime_toggle_phase, __ATOMIC_ACQUIRE));
 
     // bbport: BB_FRAME_STATS=1 prints flip rate and frame time spread every 5 seconds.
     static const bool frame_stats = EmulatorSettingsImpl::Flag("BB_FRAME_STATS", false);
