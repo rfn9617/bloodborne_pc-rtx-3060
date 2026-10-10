@@ -270,6 +270,7 @@ bool TemporalUpscaler::RasterScaling() const {
 }
 
 bool TemporalUpscaler::OnFrameStart() {
+    TrackLoadingScreen();
     ReportDlssFrame();
     frame_triggered = frame_invalid_input = false;
     // bbport: BB_PRESET_FILE=<file> holding a preset number, read about once a second: switches
@@ -2135,38 +2136,62 @@ bool TemporalUpscaler::RecordDlss(vk::CommandBuffer cmdbuf, const Dlss::Resource
     return ok;
 }
 
-void TemporalUpscaler::ReportDlssFrame() {
-    if (!BbStats::enabled || applied_upscaler != BbSettings::UpscalerDlss) return;
-    ++dlss_stats.frames;
+void TemporalUpscaler::TrackLoadingScreen() {
+    // Loading screens: no 3D scene for a while (also the title menu). They may go without the
+    // frame limit (BB_FAST_LOADING: 1 always; 2 to compare: two loading screens with the limit,
+    // two without, and so on, so that trips back and forth get both), and BB_FRAME_STATS
+    // prints how long each one took and what the game read meanwhile.
+    static const int fast_loading = [] {
+        const char* env = std::getenv("BB_FAST_LOADING");
+        return env ? std::atoi(env) : 0;
+    }();
     const bool scene = scene_color || camera_motion.Depth();
-    // Loading screens: how long the game shows no 3D scene and what it reads meanwhile, to
-    // compare builds and settings by the real length of each loading screen.
     if (!scene) {
         const auto now = std::chrono::steady_clock::now();
         if (!no_scene_frames++) {
             no_scene_since = now;
-            no_scene_cpu = BbPower::ProcessCpuSeconds();
-            runtime_file_stats(no_scene_files);
-        } else if (now - no_scene_since >= std::chrono::milliseconds(250)) {
+            if (BbStats::enabled) {
+                no_scene_cpu = BbPower::ProcessCpuSeconds();
+                runtime_file_stats(no_scene_files);
+            }
+        } else if (!BbStats::loading_screen.load(std::memory_order_relaxed) &&
+                   now - no_scene_since >= std::chrono::milliseconds(250)) {
+            ++loading_screens;
+            BbStats::loading_unlimited.store(
+                fast_loading == 1 || (fast_loading == 2 && loading_screens / 2 % 2 == 1),
+                std::memory_order_relaxed);
             BbStats::loading_screen.store(true, std::memory_order_relaxed);
         }
-    } else if (no_scene_frames) {
-        BbStats::loading_screen.store(false, std::memory_order_relaxed);
-        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                                             no_scene_since).count();
-        if (seconds >= 1.0) {
-            uint64_t files[5];
-            runtime_file_stats(files);
-            std::printf("Loading screen: %.2f s without a 3D scene, %llu frames (%.0f FPS); "
-                        "process CPU %.2f cores; files: %.1f MB in %llu reads, %.0f ms reading\n",
-                        seconds, (unsigned long long)no_scene_frames, no_scene_frames / seconds,
-                        (BbPower::ProcessCpuSeconds() - no_scene_cpu) / seconds,
-                        (files[2] - no_scene_files[2]) / 1e6,
-                        (unsigned long long)(files[1] - no_scene_files[1]),
-                        (files[3] - no_scene_files[3]) / 1e6);
-        }
-        no_scene_frames = 0;
+        return;
     }
+    if (!no_scene_frames) {
+        return;
+    }
+    const bool unlimited = BbStats::loading_unlimited.load(std::memory_order_relaxed);
+    BbStats::loading_screen.store(false, std::memory_order_relaxed);
+    BbStats::loading_unlimited.store(false, std::memory_order_relaxed);
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - no_scene_since).count();
+    if (BbStats::enabled && seconds >= 1.0) {
+        uint64_t files[5];
+        runtime_file_stats(files);
+        std::printf("Loading screen: %.2f s without a 3D scene, %llu frames (%.0f FPS, frame "
+                    "limit %s); process CPU %.2f cores; files: %.1f MB in %llu reads, %.0f ms "
+                    "reading\n",
+                    seconds, (unsigned long long)no_scene_frames, no_scene_frames / seconds,
+                    unlimited ? "off" : "on",
+                    (BbPower::ProcessCpuSeconds() - no_scene_cpu) / seconds,
+                    (files[2] - no_scene_files[2]) / 1e6,
+                    (unsigned long long)(files[1] - no_scene_files[1]),
+                    (files[3] - no_scene_files[3]) / 1e6);
+    }
+    no_scene_frames = 0;
+}
+
+void TemporalUpscaler::ReportDlssFrame() {
+    if (!BbStats::enabled || applied_upscaler != BbSettings::UpscalerDlss) return;
+    ++dlss_stats.frames;
+    const bool scene = scene_color || camera_motion.Depth();
     if (scene) {
         ++dlss_stats.scenes;
         if (!dispatched_last_frame) {

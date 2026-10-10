@@ -172,6 +172,8 @@ private:
                     const Dlss::Resource& depth, u32 w, u32 h, u32 ow, u32 oh, float frame_ms,
                     bool hdr);
     void ReportDlssFrame();
+    /// Loading screens (no 3D scene): BbStats::loading_screen, BB_FAST_LOADING, their length.
+    void TrackLoadingScreen();
     struct DlssStats {
         u64 frames = 0, scenes = 0, evaluated = 0, resets = 0, recreated = 0;
         u64 missing_trigger = 0, not_ready = 0, invalid_input = 0, errors = 0;
@@ -184,6 +186,7 @@ private:
     u64 no_scene_frames = 0;
     uint64_t no_scene_files[5] = {};
     double no_scene_cpu = 0.0;
+    u64 loading_screens = 0;
     /// Records FSR 4 into output_image; on a permanent failure FSR 3 takes over.
     bool RecordFsr4(vk::CommandBuffer cmdbuf, Fsr4Upscaler::Image color, Fsr4Upscaler::Image depth,
                     u32 w, u32 h, u32 ow, u32 oh, float frame_ms);

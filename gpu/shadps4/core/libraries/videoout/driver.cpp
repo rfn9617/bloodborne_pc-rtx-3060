@@ -631,6 +631,11 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     }());
     // The slot after a flip at `now`: `divisor` refreshes after the refresh just before it.
     const auto next_slot = [&](std::chrono::steady_clock::time_point now) {
+        // bbport: a loading screen without the limit (BB_FAST_LOADING): the next flip may go
+        // at once; the limit resumes from the last flip when the 3D scene returns.
+        if (BbStats::loading_unlimited.load(std::memory_order_relaxed)) {
+            return now;
+        }
         BbVblank::Sample vb{};
         if (vsync_lock && BbVblank::Latest(vb) && vb.time <= now) {
             const auto since = now - vb.time;
