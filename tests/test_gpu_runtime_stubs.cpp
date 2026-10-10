@@ -20,6 +20,7 @@ unsigned runtime_toggle_phase = 0;
 int bb_setjmp(sigjmp_buf) { std::abort(); }
 #endif
 uint64_t runtime_tsc_frequency() { return 1000000000; }
+void runtime_file_stats(uint64_t out[5]) { for (int i = 0; i < 5; ++i) out[i] = 0; }
 int runtime_file_translate(const char*, char*, size_t) { std::abort(); }
 uint64_t runtime_memory_clamp(uintptr_t, uint64_t size) { if (runtime_test_fake_memory) return size; std::abort(); }
 uint64_t runtime_process_time_us() { return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }

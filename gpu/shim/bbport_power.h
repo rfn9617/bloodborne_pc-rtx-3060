@@ -13,4 +13,7 @@ void Start();
 /// BB_FRAME_STATS).
 void PrintWindow(double seconds, unsigned frames);
 
+/// CPU time of the whole process so far (user + kernel, all threads), in seconds.
+double ProcessCpuSeconds();
+
 } // namespace BbPower

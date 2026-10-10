@@ -178,6 +178,12 @@ private:
     } dlss_stats;
     bool frame_triggered = false, frame_invalid_input = false;
     std::chrono::steady_clock::time_point dlss_report_time{};
+    /// BB_FRAME_STATS: the current stretch of display frames without a 3D scene (loading
+    /// screens, menus), printed when the scene returns.
+    std::chrono::steady_clock::time_point no_scene_since{};
+    u64 no_scene_frames = 0;
+    uint64_t no_scene_files[5] = {};
+    double no_scene_cpu = 0.0;
     /// Records FSR 4 into output_image; on a permanent failure FSR 3 takes over.
     bool RecordFsr4(vk::CommandBuffer cmdbuf, Fsr4Upscaler::Image color, Fsr4Upscaler::Image depth,
                     u32 w, u32 h, u32 ow, u32 oh, float frame_ms);

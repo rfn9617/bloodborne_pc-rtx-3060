@@ -120,6 +120,9 @@ inline std::atomic<std::uint64_t> t_resident{0}, t_protect{0}, t_image_create{0}
     t_write_faults{0}, t_copy_cpu{0}, copy_sys_us{0}, copy_minflt{0};
 /// Pipeline barriers recorded (Runtime::FlushBarriers) and the image barriers in them.
 inline std::atomic<std::uint64_t> barrier_calls{0}, barrier_images{0};
+/// The game shows no 3D scene for a while (loading screens, title menu; BB_FRAME_STATS with
+/// DLSS): the CPU sampler's BB_CPU_SAMPLE=3 records only then.
+inline std::atomic<bool> loading_screen{false};
 /// Render pass instances begun (Scheduler::BeginRendering).
 inline std::atomic<std::uint64_t> render_passes{0};
 /// Image barriers made by Image::GetBarriers by old and new layout (LayoutIndex) and whether

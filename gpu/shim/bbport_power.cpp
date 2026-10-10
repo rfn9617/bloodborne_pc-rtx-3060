@@ -334,13 +334,29 @@ void PrintWindow(double seconds, unsigned frames) {
     Get().Print(seconds, frames);
 }
 
+double ProcessCpuSeconds() {
+    FILETIME creation, exit, kernel, user;
+    if (!GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user)) {
+        return 0.0;
+    }
+    return double(FileTime(kernel) + FileTime(user)) / 1e7;
+}
+
 } // namespace BbPower
 
 #else
 
+#include <sys/resource.h>
+
 namespace BbPower {
 void Start() {}
 void PrintWindow(double, unsigned) {}
+double ProcessCpuSeconds() {
+    rusage usage{};
+    getrusage(RUSAGE_SELF, &usage);
+    return double(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) +
+           double(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1e6;
+}
 } // namespace BbPower
 
 #endif

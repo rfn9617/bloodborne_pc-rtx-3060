@@ -14,6 +14,7 @@
 
 #include <vk_mem_alloc.h>
 
+#include "bbport_power.h"
 #include "bbport_settings.h"
 #include "bbport_toggles.h"
 #include "ffx_vk_portable.h"
@@ -30,6 +31,8 @@
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
+
+extern "C" void runtime_file_stats(uint64_t out[5]);
 
 namespace Vulkan {
 
@@ -2135,7 +2138,36 @@ bool TemporalUpscaler::RecordDlss(vk::CommandBuffer cmdbuf, const Dlss::Resource
 void TemporalUpscaler::ReportDlssFrame() {
     if (!BbStats::enabled || applied_upscaler != BbSettings::UpscalerDlss) return;
     ++dlss_stats.frames;
-    if (scene_color || camera_motion.Depth()) {
+    const bool scene = scene_color || camera_motion.Depth();
+    // Loading screens: how long the game shows no 3D scene and what it reads meanwhile, to
+    // compare builds and settings by the real length of each loading screen.
+    if (!scene) {
+        const auto now = std::chrono::steady_clock::now();
+        if (!no_scene_frames++) {
+            no_scene_since = now;
+            no_scene_cpu = BbPower::ProcessCpuSeconds();
+            runtime_file_stats(no_scene_files);
+        } else if (now - no_scene_since >= std::chrono::milliseconds(250)) {
+            BbStats::loading_screen.store(true, std::memory_order_relaxed);
+        }
+    } else if (no_scene_frames) {
+        BbStats::loading_screen.store(false, std::memory_order_relaxed);
+        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                             no_scene_since).count();
+        if (seconds >= 1.0) {
+            uint64_t files[5];
+            runtime_file_stats(files);
+            std::printf("Loading screen: %.2f s without a 3D scene, %llu frames (%.0f FPS); "
+                        "process CPU %.2f cores; files: %.1f MB in %llu reads, %.0f ms reading\n",
+                        seconds, (unsigned long long)no_scene_frames, no_scene_frames / seconds,
+                        (BbPower::ProcessCpuSeconds() - no_scene_cpu) / seconds,
+                        (files[2] - no_scene_files[2]) / 1e6,
+                        (unsigned long long)(files[1] - no_scene_files[1]),
+                        (files[3] - no_scene_files[3]) / 1e6);
+        }
+        no_scene_frames = 0;
+    }
+    if (scene) {
         ++dlss_stats.scenes;
         if (!dispatched_last_frame) {
             if (frame_invalid_input) ++dlss_stats.invalid_input;

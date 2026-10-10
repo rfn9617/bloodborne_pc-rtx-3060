@@ -11,7 +11,11 @@
 // each busy thread's share of a core. Guest (PS4) code has no unwind tables: a stack ends at
 // its first guest frame. tools/cpu_samples.py turns the file into a report with the symbol
 // table of bb-probe.exe.
+// BB_CPU_SAMPLE=3: only while the game shows no 3D scene (loading screens; needs
+// BB_FRAME_STATS=1 and DLSS), every thread 100 times a second whether it ran or not, so the
+// stacks also show what the waiting threads wait for (sample counts = time).
 #include "bbport_cpu_sampler.h"
+#include "bbport_toggles.h"
 
 #ifdef _WIN32
 
@@ -175,6 +179,11 @@ private:
         const uint64_t now_tsc = __rdtsc();
         const ULONG64 min_cycles = std::max<ULONG64>((now_tsc - tick_tsc) / MinShareDivisor, 4000);
         tick_tsc = now_tsc;
+        // BB_CPU_SAMPLE=3: every thread on every 10th tick, during loading screens only.
+        const bool sample_all =
+            loading_only ? BbStats::loading_screen.load(std::memory_order_relaxed) &&
+                               ++loading_ticks % 10 == 0
+                         : every_thread;
         for (auto& thread : threads) {
             if (!thread->handle) continue;
             ULONG64 cycles = thread->last_cycles;
@@ -183,7 +192,7 @@ private:
             thread->last_cycles = cycles;
             thread->total_cycles += delta;
             thread->window_cycles += delta;
-            if (delta >= min_cycles || every_thread) {
+            if (sample_all || (!loading_only && delta >= min_cycles)) {
                 Sample(*thread, delta);
             }
         }
@@ -353,6 +362,8 @@ private:
     DWORD self = 0;
     /// BB_CPU_SAMPLE=2: every thread at every tick, ran or not (waits included).
     const bool every_thread = std::getenv("BB_CPU_SAMPLE")[0] == '2';
+    const bool loading_only = std::getenv("BB_CPU_SAMPLE")[0] == '3';
+    uint64_t loading_ticks = 0;
     GetThreadDescriptionFn get_description = nullptr;
     std::vector<std::unique_ptr<Thread>> threads;
     std::vector<uint8_t> copy;
@@ -364,7 +375,7 @@ private:
 
 void Start() {
     const char* enabled = std::getenv("BB_CPU_SAMPLE");
-    if (!enabled || (enabled[0] != '1' && enabled[0] != '2')) return;
+    if (!enabled || (enabled[0] != '1' && enabled[0] != '2' && enabled[0] != '3')) return;
     auto* sampler = new Sampler; // runs until the process ends
     if (const char* file = std::getenv("BB_CPU_SAMPLE_FILE"); file && file[0]) {
         sampler->path = file;
@@ -372,7 +383,9 @@ void Start() {
         const char* user = std::getenv("BB_GPU_USER_DIR");
         sampler->path = std::string(user && user[0] ? user : ".") + "\\cpu-samples.txt";
     }
-    std::printf("CPU sampler: on, 1 kHz, stacks every 10 s to %s\n", sampler->path.c_str());
+    std::printf("CPU sampler: on, %s, stacks every 10 s to %s\n",
+                enabled[0] == '3' ? "loading screens only, every thread at 100 Hz" : "1 kHz",
+                sampler->path.c_str());
     std::thread([sampler] { sampler->Run(); }).detach();
 }
 
