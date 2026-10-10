@@ -44,8 +44,10 @@ constexpr size_t MaxFrames = 48;
 constexpr size_t StackCopyBytes = 96 * 1024;
 /// Zeroed space after the copy: an unwind step reading past the copied part reads zeros.
 constexpr size_t StackPadding = 64 * 1024;
-/// Cycles a thread must have run since the last tick to be sampled (~1 us).
-constexpr ULONG64 MinCycles = 4000;
+/// Share of the time since the last tick a thread must have run to be sampled. Suspending a
+/// thread runs a kernel APC on it, which counts as running: a fixed small threshold made every
+/// thread "busy" again at each tick (2026-10-10 run: all ~60 threads sampled ~415 times a second).
+constexpr ULONG64 MinShareDivisor = 20; // 5%
 
 struct StackEntry {
     uint64_t samples = 0;
@@ -170,6 +172,9 @@ private:
     }
 
     void Tick() {
+        const uint64_t now_tsc = __rdtsc();
+        const ULONG64 min_cycles = std::max<ULONG64>((now_tsc - tick_tsc) / MinShareDivisor, 4000);
+        tick_tsc = now_tsc;
         for (auto& thread : threads) {
             if (!thread->handle) continue;
             ULONG64 cycles = thread->last_cycles;
@@ -178,7 +183,7 @@ private:
             thread->last_cycles = cycles;
             thread->total_cycles += delta;
             thread->window_cycles += delta;
-            if (delta >= MinCycles || every_thread) {
+            if (delta >= min_cycles || every_thread) {
                 Sample(*thread, delta);
             }
         }
@@ -351,7 +356,7 @@ private:
     GetThreadDescriptionFn get_description = nullptr;
     std::vector<std::unique_ptr<Thread>> threads;
     std::vector<uint8_t> copy;
-    uint64_t start_tsc = 0, window_tsc = 0;
+    uint64_t start_tsc = 0, window_tsc = 0, tick_tsc = __rdtsc();
     std::chrono::steady_clock::time_point start_time, window_time;
 };
 

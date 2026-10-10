@@ -759,7 +759,8 @@ void BufferCache::ReleaseUnmappedMemory(VAddr address, u64 size, bool assume_gpu
         scheduler.Finish();
         scheduler.PopPendingOperations();
         resident_bytes -= retired_bytes;
-        if (retired_bytes && !std::getenv("BB_QUIET_GC")) std::printf("Sparse cache: released %llu MiB after guest unmap/idle retirement; %llu MiB remain\n",
+        const char* quiet = std::getenv("BB_QUIET_GC");
+        if (retired_bytes && !(quiet && quiet[0] && quiet[0] != '0')) std::printf("Sparse cache: released %llu MiB after guest unmap/idle retirement; %llu MiB remain\n",
             (unsigned long long)(retired_bytes >> 20), (unsigned long long)(resident_bytes >> 20));
     };
     if (assume_gpu_thread) release();

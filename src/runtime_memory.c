@@ -717,10 +717,44 @@ static void *toggle_watcher(void *path) {
     }
     return NULL;
 }
+/* BB_TOGGLE_AB=<seconds>:<mask>,<mask>,...: an A/B in one run without editing a file. The
+ * masks take turns, each for <seconds>, from the first again after the last; every switch is
+ * printed, so the 5 s statistics windows of BB_FRAME_STATS can be attributed to a phase.
+ * Example: 20:0,4323455642275676160 alternates everything on with bits 58-61 off. */
+static void *toggle_alternator(void *spec) {
+    char *end=NULL;
+    unsigned long seconds=strtoul(spec,&end,10);
+    unsigned long long masks[16];
+    unsigned count=0;
+    if (seconds==0 || !end || *end!=':') return NULL;
+    for (const char *at=end+1; *at && count<16; ) {
+        masks[count++]=strtoull(at,&end,10);
+        if (end==at) { --count; break; }
+        at=*end==',' ? end+1 : end;
+        if (!*end) break;
+    }
+    if (!count) return NULL;
+    for (unsigned long long cycle=0;;++cycle) {
+        for (unsigned phase=0; phase<count; ++phase) {
+            __atomic_store_n(&runtime_disabled_optimizations,(uint64_t)masks[phase],__ATOMIC_RELEASE);
+            printf("Runtime: A/B phase %u of %u (cycle %llu), disabled optimizations mask=%llu\n",
+                   phase+1,count,cycle+1,masks[phase]);
+            fflush(stdout);
+#ifdef _WIN32
+            for (unsigned long i=0;i<seconds*4;++i) compat_sleep_ns(250000000);
+#else
+            struct timespec t={(time_t)seconds,0}; nanosleep(&t,NULL);
+#endif
+        }
+    }
+    return NULL;
+}
 void runtime_memory_set_gpu_hooks(GpuRange map, GpuRange unmap, GpuRange invalidate) {
     const char *toggles=getenv("BB_TOGGLE_FILE");
+    const char *alternate=getenv("BB_TOGGLE_AB");
     static pthread_t watcher;
-    if (toggles && !watcher) pthread_create(&watcher,NULL,toggle_watcher,(void *)toggles);
+    if (alternate && *alternate && !watcher) pthread_create(&watcher,NULL,toggle_alternator,(void *)alternate);
+    else if (toggles && !watcher) pthread_create(&watcher,NULL,toggle_watcher,(void *)toggles);
     write_lock();
     hook_map=map; hook_unmap=unmap; hook_invalidate=invalidate;
     for (size_t i=0;i<vma_count;++i) if (vmas[i].kind!=KIND_RESERVED) queue_hook(HOOK_MAP,vmas[i].start,vmas[i].end-vmas[i].start);

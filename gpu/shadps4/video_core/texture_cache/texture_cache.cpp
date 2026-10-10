@@ -1196,7 +1196,11 @@ void TextureCache::GarbageCollectImages() {
     }();
     // Keep ownership reports alive in the title menu even when no more textures are evicted.
     // Reports remain bounded to every five seconds, without per-frame instrumentation.
-    static const bool quiet_gc = std::getenv("BB_QUIET_GC") != nullptr;
+    // BB_QUIET_GC=0 turns the reports back on (the RTX 3060 profile sets 1 by default).
+    static const bool quiet_gc = [] {
+        const char* value = std::getenv("BB_QUIET_GC");
+        return value && value[0] && value[0] != '0';
+    }();
     if ((pressured || gc_downloads != 0 || gc_evictions != 0 || vram_stats) && !quiet_gc) {
         const auto now = std::chrono::steady_clock::now();
         if (now - gc_report_time >= std::chrono::seconds(5)) {
