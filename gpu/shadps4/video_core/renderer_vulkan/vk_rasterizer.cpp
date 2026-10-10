@@ -1494,6 +1494,13 @@ bool Rasterizer::BindHelperWanted() {
 }
 
 bool Rasterizer::HelperEligible(const Pipeline* pipeline) const {
+    // bbport: not on the draw recording thread. Stage B reads shader user data from the snapshot
+    // it installed for the current draw (Shader::Info::ud_snapshots, thread-local); the helper
+    // thread has none and binds textures from the wrong T#s (2026-10-10, RTX 3060: garbage
+    // everywhere with BB_TEXTURE_HELPER=1).
+    if (DrawPipe::OnStageB()) {
+        return false;
+    }
     if (pipeline->IsCompute() || !bind_helper.Available() || FrameCapture::Active() ||
         BbToggle::Disabled(BbToggle::TextureBindHelper) ||
         BbToggle::Disabled(BbToggle::TextureBindingMemo) ||
