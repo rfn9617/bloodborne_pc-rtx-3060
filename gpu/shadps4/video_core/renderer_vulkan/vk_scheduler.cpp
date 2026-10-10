@@ -276,8 +276,15 @@ void Scheduler::RecorderThread(std::stop_token stoken) {
         // Spin briefly before sleeping: the next chunk usually follows within microseconds,
         // and a sleeping recorder costs the GPU thread a wake-up syscall per kick. With few
         // hardware threads (Steam Deck: 8) the spin would take time from guest threads.
-        static const auto spin_time = std::chrono::microseconds(
+        // bbport: chunks arrive every few hundred microseconds while a frame is recorded, so a
+        // 200 us spin kept this thread busy for most of each frame (laptops: heat and power the
+        // GPU could use). 40 us still covers back-to-back chunks; the producer's wake-up is one
+        // notify per chunk of 32 KiB.
+        static const auto long_spin = std::chrono::microseconds(
             BbThreads::Available() >= 12 ? 200 : 20);
+        const auto spin_time = BbToggle::Disabled(BbToggle::ShortRecorderSpin)
+                                   ? long_spin
+                                   : std::min(long_spin, std::chrono::microseconds(40));
         const auto spin_until = std::chrono::steady_clock::now() + spin_time;
         for (u32 spins = 1; queued_chunks.load(std::memory_order_acquire) == 0; ++spins) {
             __builtin_ia32_pause();

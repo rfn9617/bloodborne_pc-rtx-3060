@@ -13,6 +13,7 @@
 
 #include <cstdlib>
 #include "bbport_threads.h"
+#include "bbport_toggles.h"
 
 #include <array>
 #include <atomic>
@@ -110,9 +111,16 @@ public:
         const u32 slot = reason < NumReasons ? reason : ReasonRasterizer;
         ++drains_by_reason[slot];
         const u64 start = __rdtsc();
+        // bbport: a drain lasts ~0.5 ms on average while stage B records the queued draws
+        // (~500 a second in the sewers). Yielding in a loop kept this thread on a core all that
+        // time; after the spin it now sleeps until stage B has run the last packet.
+        const bool sleep = !BbToggle::Disabled(BbToggle::DrainSleep);
         for (u32 spins = 0; consumed.load(std::memory_order_acquire) != head; ++spins) {
             if (spins < 4096) {
                 __builtin_ia32_pause();
+            } else if (sleep) {
+                SleepUntilDrained();
+                break;
             } else {
                 std::this_thread::yield();
             }
@@ -148,6 +156,30 @@ private:
 
     static constexpr u32 Align(u32 size) {
         return (size + 63) & ~63u;
+    }
+
+    /// Stage A: blocks until `consumed` reaches `head`; stage B wakes it (Consume).
+    void SleepUntilDrained() {
+        drain_target.store(head, std::memory_order_relaxed);
+        while (true) {
+            const u32 seen = drain_wake.load(std::memory_order_seq_cst);
+            drain_waiting.store(true, std::memory_order_seq_cst);
+            if (consumed.load(std::memory_order_seq_cst) == head) {
+                break;
+            }
+            drain_wake.wait(seen, std::memory_order_seq_cst);
+        }
+        drain_waiting.store(false, std::memory_order_relaxed);
+    }
+
+    /// Stage B: publishes the position after a packet; wakes a draining stage A at the end.
+    void Consume(u64 at) {
+        consumed.store(at, std::memory_order_seq_cst);
+        if (drain_waiting.load(std::memory_order_seq_cst) &&
+            at >= drain_target.load(std::memory_order_relaxed)) {
+            drain_wake.fetch_add(1, std::memory_order_seq_cst);
+            drain_wake.notify_one();
+        }
     }
 
     void WaitForSpace(u64 at, u64 size) {
@@ -195,14 +227,14 @@ private:
             const auto* header = reinterpret_cast<const Header*>(ring.get() + at % Capacity);
             if (header->size == 0) {
                 at += Capacity - at % Capacity;
-                consumed.store(at, std::memory_order_release);
+                Consume(at);
                 continue;
             }
             const u64 start = __rdtsc();
             handler(context, reinterpret_cast<const u8*>(header + 1), header->payload);
             busy_cycles.fetch_add(__rdtsc() - start, std::memory_order_relaxed);
             at += header->size;
-            consumed.store(at, std::memory_order_release);
+            Consume(at);
         }
     }
 
@@ -216,6 +248,9 @@ private:
     alignas(64) std::atomic<u64> consumed{0};
     alignas(64) std::atomic<u32> wake{0};
     std::atomic<bool> sleeping{false};
+    alignas(64) std::atomic<u32> drain_wake{0}; ///< stage B -> stage A (SleepUntilDrained)
+    std::atomic<bool> drain_waiting{false};
+    std::atomic<u64> drain_target{0};
     std::atomic<u32> stage_b_tid{0};
     std::jthread thread;
 };

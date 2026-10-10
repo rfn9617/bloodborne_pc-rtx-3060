@@ -217,6 +217,7 @@ DrawPreparation::~DrawPreparation() {
         scanner.request_stop();
     }
     cv.notify_all();
+    worker_cv.notify_all();
     workers.clear();
     scanner = {};
 }
@@ -244,7 +245,13 @@ void DrawPreparation::Enqueue(u64 seq, std::shared_ptr<Submission> submission) {
         std::scoped_lock lk{mutex};
         submissions.push_back(std::move(submission));
     }
+    // bbport: a new buffer is work for the scanner only; workers follow its scans. Waking
+    // every worker on each of the hundreds of submissions a second cost CPU time and lock
+    // contention for nothing (PrepWakeOne off: the previous behaviour).
     cv.notify_all();
+    if (BbToggle::Disabled(BbToggle::PrepWakeOne)) {
+        worker_cv.notify_all();
+    }
 }
 
 void DrawPreparation::BeginSubmission(u64 seq, const AmdGpu::Regs& regs, u64 reg_checksum) {
@@ -262,6 +269,7 @@ void DrawPreparation::BeginSubmission(u64 seq, const AmdGpu::Regs& regs, u64 reg
         baseline_seq = tail_seq = seq;
         baseline_ready = true;
         cv.notify_all();
+        worker_cv.notify_all();
     }
     // Idle helpers can starve on a busy CPU. Rather than queueing without bound, restart
     // them from the GPU thread's own state (one register copy) once the scanner lags.
@@ -276,6 +284,7 @@ void DrawPreparation::BeginSubmission(u64 seq, const AmdGpu::Regs& regs, u64 reg
         }
         ++rebases;
         cv.notify_all();
+        worker_cv.notify_all();
     }
     if (!submissions.empty() && seq >= submissions.front()->seq &&
         seq - submissions.front()->seq < submissions.size()) {
@@ -374,7 +383,13 @@ void DrawPreparation::ScannerLoop(std::stop_token stop) {
             submission->scanned.store(true, std::memory_order_release);
         }
         ++next_seq;
-        cv.notify_all();
+        // One scanned submission: one worker can claim it.
+        if (BbToggle::Disabled(BbToggle::PrepWakeOne)) {
+            cv.notify_all();
+            worker_cv.notify_all();
+        } else {
+            worker_cv.notify_one();
+        }
     }
 }
 
@@ -409,7 +424,7 @@ void DrawPreparation::WorkerLoop(std::stop_token stop, u32 index) {
         {
             std::unique_lock lk{mutex};
             // gpu_seq moves without the lock: keep the candidate the predicate found.
-            cv.wait(lk, stop, [&] {
+            worker_cv.wait(lk, stop, [&] {
                 target = baseline_ready ? claimable() : nullptr;
                 return target != nullptr;
             });

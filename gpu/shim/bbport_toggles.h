@@ -74,6 +74,10 @@ enum : std::uint64_t {
     IndexRangeLongCache = 1ull << 59, ///< index ranges re-scanned every 240 frames, not 32
     SamplerMemo = 1ull << 60,         ///< recent samplers found without the cache lock
     PaletteHashStageA = 1ull << 61,   ///< bone palettes hashed on stage A, not read from VRAM
+    // Less idle spinning (2026-10-10, laptop power), A/B in one run:
+    ShortRecorderSpin = 1ull << 56, ///< the Vulkan recorder sleeps after 40 us without work, not 200
+    DrainSleep = 1ull << 62,        ///< stage A sleeps in long drains instead of yielding in a loop
+    PrepWakeOne = 1ull << 63,       ///< one draw-preparation worker woken per scanned submission
     // Bits 20-29 are used as raw debug toggles by the camera/object motion and the upscaler.
 };
 inline bool Disabled(std::uint64_t bit) {

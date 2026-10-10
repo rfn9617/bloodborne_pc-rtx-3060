@@ -146,7 +146,8 @@ private:
     u64 rebases = 0; ///< scanner restarts from the GPU thread state (BB_FRAME_STATS)
     bool baseline_ready{}; ///< guarded by `mutex`
     std::mutex mutex;
-    std::condition_variable_any cv;
+    std::condition_variable_any cv;        ///< the scanner (and workers with PrepWakeOne off)
+    std::condition_variable_any worker_cv; ///< workers: a scanned submission to claim
     std::deque<std::shared_ptr<Submission>> submissions; ///< ordered by seq
     std::atomic<u64> gpu_seq{0};
     std::shared_ptr<Submission> current;
