@@ -22,6 +22,11 @@
 #include "video_core/host_shaders/tiling_micro_64_comp.h"
 #include "video_core/host_shaders/tiling_micro_8_comp.h"
 #include "video_core/host_shaders/tiling_micro_96_comp.h"
+#include "video_core/host_shaders/tiling_depth_micro_comp.h"
+#include "video_core/host_shaders/tiling_depth_macro_comp.h"
+#include "bbport_toggles.h"
+#include "common/div_ceil.h"
+#include <cstdlib>
 
 #include <magic_enum/magic_enum.hpp>
 #include <vk_mem_alloc.h>
@@ -86,12 +91,13 @@ TileManager::TileManager(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
 
 TileManager::~TileManager() = default;
 
-vk::Pipeline TileManager::GetTilingPipeline(const ImageInfo& info, bool is_tiler) {
+vk::Pipeline TileManager::GetTilingPipeline(const ImageInfo& info, bool is_tiler, bool from_depth) {
     const TilingKey key{
         .tile_mode = info.tile_mode,
         .num_bits = info.num_bits,
         .num_samples = info.num_samples,
         .is_tiler = is_tiler,
+        .from_depth = from_depth,
     };
     if (const auto it = tiling_pipelines.find(key); it != tiling_pipelines.end()) {
         return *it->second;
@@ -150,6 +156,12 @@ vk::Pipeline TileManager::GetTilingPipeline(const ImageInfo& info, bool is_tiler
         UNREACHABLE_MSG("Unsupported tiling pixel width {}", info.num_bits);
     }
 
+    if (from_depth) {
+        EnsureDepthResources();
+        code = is_macro ? std::span<const u32>{TILING_DEPTH_MACRO_COMP}
+                        : std::span<const u32>{TILING_DEPTH_MICRO_COMP};
+    }
+
     const auto module = Vulkan::CompileSPV(code, device);
     static constexpr auto spec_entries = [] {
         std::array<vk::SpecializationMapEntry, 12> entries{};
@@ -180,7 +192,7 @@ vk::Pipeline TileManager::GetTilingPipeline(const ImageInfo& info, bool is_tiler
     };
     const vk::ComputePipelineCreateInfo compute_pipeline_ci = {
         .stage = shader_ci,
-        .layout = *pl_layout,
+        .layout = from_depth ? *depth_pl_layout : *pl_layout,
     };
 
     auto [result, pipeline] =
@@ -278,6 +290,14 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
 
 void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buffer_copies,
                             const VideoCore::Buffer* out_buffer, u64 out_offset) {
+    static const bool depth_fusion = [] {
+        const char* env = std::getenv("BB_DEPTH_TILE_FUSION");
+        return env && env[0] == '1';
+    }();
+    if (depth_fusion && !BbToggle::Disabled(BbToggle::High::DepthTileFusion) &&
+        TryTileDepthImage(in_image, buffer_copies, out_buffer, out_offset)) {
+        return;
+    }
     const auto& info = in_image.info;
     if (!info.props.is_tiled) {
         for (auto& copy : buffer_copies) {
@@ -332,6 +352,106 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     runtime.AccessBuffer(out_buffer, out_offset, info.guest_size,
                          vk::PipelineStageFlagBits2::eComputeShader,
                          vk::AccessFlagBits2::eShaderWrite);
+}
+
+void TileManager::EnsureDepthResources() {
+    if (depth_pl_layout) return;
+    const auto device = instance.GetDevice();
+    const std::array<vk::DescriptorSetLayoutBinding, 3> bindings{{
+        {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute},
+        {1, vk::DescriptorType::eCombinedImageSampler, 1, vk::ShaderStageFlagBits::eCompute},
+        {2, vk::DescriptorType::eUniformBuffer, 1, vk::ShaderStageFlagBits::eCompute},
+    }};
+    depth_desc_layout = Vulkan::Check(device.createDescriptorSetLayoutUnique({
+        .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+        .bindingCount = u32(bindings.size()), .pBindings = bindings.data(),
+    }));
+    const auto layout = *depth_desc_layout;
+    depth_pl_layout = Vulkan::Check(device.createPipelineLayoutUnique({
+        .setLayoutCount = 1, .pSetLayouts = &layout,
+    }));
+    depth_sampler = Vulkan::Check(device.createSamplerUnique({
+        .magFilter = vk::Filter::eNearest, .minFilter = vk::Filter::eNearest,
+        .mipmapMode = vk::SamplerMipmapMode::eNearest,
+        .addressModeU = vk::SamplerAddressMode::eClampToEdge,
+        .addressModeV = vk::SamplerAddressMode::eClampToEdge,
+        .addressModeW = vk::SamplerAddressMode::eClampToEdge,
+        .maxLod = 0.0f,
+    }));
+}
+
+bool TileManager::TryTileDepthImage(Image& image, std::span<const vk::BufferImageCopy> copies,
+                                    const Buffer* output, u64 offset) {
+    const auto& i = image.info;
+    if (!output || !image.backing || i.num_bits != 32 || !i.props.is_depth ||
+        !i.props.is_tiled || i.props.is_volume || i.props.is_block || i.alt_tile ||
+        i.type != AmdGpu::ImageType::Color2D || i.num_samples != 1 ||
+        image.backing->num_samples != 1 || i.resources.levels != 1 ||
+        i.resources.layers != 1 || i.size.depth != 1 || !i.guest_size ||
+        (i.pixel_format != vk::Format::eD32Sfloat &&
+         i.pixel_format != vk::Format::eD32SfloatS8Uint) ||
+        image.backing->image.image_ci.format != i.pixel_format ||
+        AmdGpu::GetMicroTileThickness(i.array_mode) != 1 ||
+        offset % instance.StorageMinAlignment() || offset > output->size_bytes ||
+        i.guest_size > output->size_bytes - offset || copies.size() != 1) {
+        return false;
+    }
+    const auto& c = copies[0];
+    const auto& mip = i.mips_layout[0];
+    if (c.bufferOffset || c.bufferRowLength != mip.pitch || c.bufferImageHeight != mip.height ||
+        c.imageSubresource.aspectMask != vk::ImageAspectFlagBits::eDepth ||
+        c.imageSubresource.mipLevel || c.imageSubresource.baseArrayLayer ||
+        c.imageSubresource.layerCount != 1 || c.imageOffset != vk::Offset3D{} ||
+        c.imageExtent != vk::Extent3D{i.size.width, i.size.height, 1} ||
+        mip.offset || mip.size != i.guest_size || mip.pitch < i.size.width ||
+        mip.height < i.size.height || !mip.pitch || !mip.height) {
+        return false;
+    }
+
+    const auto pipeline = GetTilingPipeline(i, true, true);
+    ImageViewInfo view_info;
+    view_info.format = vk::Format::eR32Sfloat; // FindView selects only the depth aspect.
+    const auto view = *image.FindView(view_info, false).image_view;
+    TilingInfo params{};
+    params.bank_swizzle = i.bank_swizzle;
+    params.num_slices = params.num_mips = 1;
+    params.mips[0] = mip;
+    const vk::DescriptorBufferInfo uniform{
+        .buffer = stream_buffer.Handle(),
+        .offset = stream_buffer.Copy(&params, sizeof(params), instance.UniformMinAlignment()),
+        .range = sizeof(params),
+    };
+    const vk::DescriptorBufferInfo out{output->Handle(), offset, i.guest_size};
+    const vk::DescriptorImageInfo input{*depth_sampler, view,
+                                        vk::ImageLayout::eShaderReadOnlyOptimal};
+    scheduler.EndRendering();
+    const Vulkan::Runtime::TransferMark mark{runtime, "depth download+tile fused", image};
+    bool barrier = runtime.Transit(&image, vk::ImageLayout::eShaderReadOnlyOptimal,
+        vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderSampledRead);
+    barrier |= runtime.IsBufferAccessed(output, offset, i.guest_size, true);
+    if (barrier) runtime.FlushBarriers();
+    scheduler.Record([pipeline, layout = *depth_pl_layout, out, input, uniform,
+                      groups = Common::DivCeil(i.guest_size / 4, 64u)](vk::CommandBuffer cmd) {
+        const std::array<vk::WriteDescriptorSet, 3> writes{{
+            {.dstBinding=0, .descriptorCount=1, .descriptorType=vk::DescriptorType::eStorageBuffer,
+             .pBufferInfo=&out},
+            {.dstBinding=1, .descriptorCount=1,
+             .descriptorType=vk::DescriptorType::eCombinedImageSampler, .pImageInfo=&input},
+            {.dstBinding=2, .descriptorCount=1, .descriptorType=vk::DescriptorType::eUniformBuffer,
+             .pBufferInfo=&uniform},
+        }};
+        cmd.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
+        cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, writes);
+        cmd.dispatch(groups, 1, 1);
+    });
+    runtime.AccessBuffer(output, offset, i.guest_size, vk::PipelineStageFlagBits2::eComputeShader,
+                         vk::AccessFlagBits2::eShaderStorageWrite);
+    static std::atomic_flag announced = ATOMIC_FLAG_INIT;
+    if (!announced.test_and_set(std::memory_order_relaxed)) {
+        std::printf("Depth tile fusion: active for %ux%u %s (BB_DEPTH_TILE_FUSION=0: legacy)\n",
+                    i.size.width, i.size.height, vk::to_string(i.pixel_format).c_str());
+    }
+    return true;
 }
 
 } // namespace VideoCore

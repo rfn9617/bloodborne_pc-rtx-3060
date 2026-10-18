@@ -2,15 +2,18 @@
 #include "video_core/renderer_vulkan/vk_camera_motion.h"
 
 #include <cmath>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <format>
 
 #include "bbport_toggles.h"
 
 #include "video_core/host_shaders/camera_motion_comp.h"
 #include "video_core/host_shaders/camera_motion_debug_comp.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_frame_capture.h"
 #include "video_core/renderer_vulkan/vk_object_motion.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -152,6 +155,34 @@ CameraMotion::CameraMotion(const Instance& instance_, Scheduler& scheduler_,
 
 CameraMotion::~CameraMotion() = default;
 
+void CameraMotion::ReportBlurState() const {
+    const auto reproject = Multiply(previous.view, current.inv_view);
+    const auto identity = Multiply(current.view, current.inv_view);
+    float inverse_error = 0.0f;
+    unsigned nonfinite = 0;
+    for (unsigned i = 0; i < 12; ++i) {
+        const float want = i == 0 || i == 5 || i == 10 ? 1.0f : 0.0f;
+        inverse_error = std::max(inverse_error, std::abs(identity[i] - want));
+        nonfinite += !std::isfinite(current.view[i]) + !std::isfinite(current.inv_view[i]) +
+                     !std::isfinite(previous.view[i]) + !std::isfinite(reproject[i]);
+    }
+    for (unsigned i = 0; i < 4; ++i)
+        nonfinite += !std::isfinite(current.proj[i]) + !std::isfinite(previous.proj[i]);
+    std::printf("Blur camera: valid %d/%d, render %ux%u, inverse error %.7g, nonfinite %u; "
+                "position %.7g %.7g %.7g; viewport signs %.0f %.0f\n",
+                current.valid, previous.valid, render_size[0], render_size[1], inverse_error,
+                nonfinite, current.inv_view[3], current.inv_view[7], current.inv_view[11],
+                gbuffer_x_sign, gbuffer_y_sign);
+    const auto print = [](const char* label, const auto& values) {
+        std::printf("Blur %s:", label);
+        for (const float value : values) std::printf(" %.9g", value);
+        std::puts("");
+    };
+    print("projection", current.proj);
+    print("previous projection", previous.proj);
+    print("reprojection", reproject);
+}
+
 float CameraMotion::VerticalFov() const noexcept {
     return 2.0f * std::atan(1.0f / std::abs(current.proj[1]));
 }
@@ -181,6 +212,12 @@ void CameraMotion::RecordMotion(vk::CommandBuffer cmdbuf, vk::ImageView depth_vi
     bool object_valid = false;
     const vk::ImageView object_view = object_motion && object_motion->Enabled()
         ? object_motion->PrepareRead(cmdbuf, width, height, object_valid) : depth_view;
+    static const bool history_guard=[] {
+        const char* value=std::getenv("BB_OBJECT_MOTION_GUARD");
+        const bool enabled=value && value[0]=='1';
+        if(enabled) std::puts("Object motion history guard: large relative jumps fall back to camera reprojection");
+        return enabled;
+    }();
     const PushConstants push{
         .reproject = Multiply(previous.view, current.inv_view),
         .proj = current.proj,
@@ -188,8 +225,26 @@ void CameraMotion::RecordMotion(vk::CommandBuffer cmdbuf, vk::ImageView depth_vi
         .size = {float(width), float(height)},
         .jitter = jitter,
         .previous_jitter = previous_jitter,
-        .mode = object_valid ? 1u : 0u,
+        .mode = (object_valid ? 1u : 0u) | (history_guard ? 2u : 0u),
     };
+    if(FrameCapture::Active()) {
+        static const bool details=[] {
+            const char* value=std::getenv("BB_CAPTURE_DRAW_DETAILS");
+            return value && value[0]=='1';
+        }();
+        if(details) {
+            std::string note=std::format("\n  MOTION_PARAMETERS size {} {} mode {} current_valid {} previous_valid {}",
+                                        width,height,push.mode,current.valid,previous.valid);
+            const auto append=[&](const char* name,const auto& values) {
+                note+=std::format("\n    {}",name);
+                for(float value:values) note+=std::format(" {:.9g}",value);
+            };
+            append("reproject",push.reproject);append("proj",push.proj);
+            append("previous_proj",push.prev_proj);append("jitter",push.jitter);
+            append("previous_jitter",push.previous_jitter);
+            FrameCapture::Note(note.c_str());
+        }
+    }
     const vk::DescriptorImageInfo depth_info{.imageView = depth_view,
                                              .imageLayout = vk::ImageLayout::eGeneral};
     const vk::DescriptorImageInfo motion_info{.imageView = motion_view,

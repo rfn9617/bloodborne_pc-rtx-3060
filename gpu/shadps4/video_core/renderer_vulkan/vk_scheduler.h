@@ -25,6 +25,7 @@
 #include "video_core/amdgpu/regs_primitive.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
+#include "video_core/renderer_vulkan/host_copy_sources.h"
 
 namespace tracy {
 class VkCtxScope;
@@ -800,6 +801,10 @@ public:
     /// submission that reads them. Waits for all.
     void WaitHostCopies();
 
+    /// Opt-in CPU WRITE_DATA optimization; fences/submissions still wait for all copies.
+    void WaitHostCopiesFor(u64 address, u64 size);
+    void NoteHostCopySource(u64 address, u64 size);
+
     /// Runs `copy` on the recording thread in order with the commands (the thread spins for
     /// work anyway, so small copies cost no wakeup); WaitHostCopies() covers it.
     template <typename Func>
@@ -920,6 +925,8 @@ private:
     bool recorder_sleeping = false; ///< waiting on recorder_cv (guarded by recorder_mutex)
     bool direct_mode = false; ///< the command buffer is recorded on the caller's thread
     u64 host_copies_issued = 0;
+    bool host_copy_ranges = false;
+    HostCopySources host_copy_sources;
     std::atomic<u64> host_copies_done{0};
     std::atomic<u64> deferred_signals_issued{0}; ///< by the thread recording (A or B)
     std::shared_ptr<std::atomic<u64>> deferred_signals_done =

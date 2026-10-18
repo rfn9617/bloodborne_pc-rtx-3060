@@ -1,0 +1,36 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Microbenchmark candidates for buffer_multi_copy.comp; no production change.
+#version 450
+#ifndef GROUP_SIZE
+#define GROUP_SIZE 64
+#endif
+#ifndef VECTOR_COPY
+#define VECTOR_COPY 0
+#endif
+layout(local_size_x = GROUP_SIZE) in;
+layout(std430, binding = 0) readonly buffer Source { uint src[]; };
+layout(std430, binding = 1) writeonly buffer Destination { uint dst[]; };
+layout(std430, binding = 2) readonly buffer Regions { uvec4 regions[]; };
+#if VECTOR_COPY
+layout(std430, binding = 0) readonly buffer Source4 { uvec4 src4[]; };
+layout(std430, binding = 1) writeonly buffer Destination4 { uvec4 dst4[]; };
+#endif
+layout(push_constant) uniform Push { uint count; } push;
+void main() {
+    const uint index = gl_WorkGroupID.x;
+    if (index >= push.count) return;
+    const uvec4 r = regions[index];
+#if VECTOR_COPY
+    if (((r.x | r.y) & 3u) == 0u) {
+        const uint whole = r.z / 4u;
+        for (uint i = gl_LocalInvocationID.x; i < whole; i += GROUP_SIZE)
+            dst4[r.y / 4u + i] = src4[r.x / 4u + i];
+        const uint tail = whole * 4u;
+        for (uint i = tail + gl_LocalInvocationID.x; i < r.z; i += GROUP_SIZE)
+            dst[r.y + i] = src[r.x + i];
+        return;
+    }
+#endif
+    for (uint i = gl_LocalInvocationID.x; i < r.z; i += GROUP_SIZE)
+        dst[r.y + i] = src[r.x + i];
+}

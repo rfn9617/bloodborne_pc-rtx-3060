@@ -28,6 +28,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_shader_hle.h"
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
@@ -460,6 +461,14 @@ void VideoOutDriver::Flip(const Request& req) {
                         BbStats::tick_wait_ns.exchange(0) / (window * 1e7),
                         frames ? double(BbStats::reduced_draws.exchange(0)) / frames : 0.0,
                         frames ? double(BbStats::scene_draws.exchange(0)) / frames : 0.0);
+            std::printf("Host copy range checks: %llu skipped, %llu full waits in %.1f s\n",
+                        static_cast<unsigned long long>(BbStats::host_copy_waits_skipped.exchange(0)),
+                        static_cast<unsigned long long>(BbStats::host_copy_range_waits.exchange(0)),
+                        window);
+            std::printf("Multi-copy dispatches: %llu vector, %llu scalar in %.1f s\n",
+                        static_cast<unsigned long long>(BbStats::multi_copy_vector.exchange(0)),
+                        static_cast<unsigned long long>(BbStats::multi_copy_scalar.exchange(0)), window);
+            Vulkan::PrintMultiCopyRegionStats(window);
             // Frame pacing: spread of the guest flip intervals (judder that the mean hides).
             if (intervals.size() > 2) {
                 std::vector<double> sorted = intervals;

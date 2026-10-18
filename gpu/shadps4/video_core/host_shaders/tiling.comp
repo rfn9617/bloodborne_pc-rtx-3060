@@ -95,9 +95,14 @@ layout (set = 0, binding = 0, scalar) buffer InputBuf {
     BLOCK_TYPE tiled_data[];
 };
 
+#if TILE_DEPTH_IMAGE
+// Experimental depth download + tiling in one dispatch; 32-bit, one mip/layer only.
+layout (set = 0, binding = 1) uniform sampler2D depth_image;
+#else
 layout (set = 0, binding = 1, scalar) buffer OutputBuf {
     BLOCK_TYPE linear_data[];
 };
+#endif
 
 layout (set = 0, binding = 2, scalar) uniform TilingInfo {
     uint bank_swizzle;
@@ -426,6 +431,9 @@ uint GetMipLevel(inout uint texel) {
 
 void main() {
     uint texel = gl_GlobalInvocationID.x;
+#if TILE_DEPTH_IMAGE
+    if (texel >= info.mips[0].size / BYTES_PER_PIXEL) return;
+#endif
     uint mip = GetMipLevel(texel);
     uint pitch = info.mips[mip].pitch;
     uint height = info.mips[mip].height;
@@ -440,9 +448,18 @@ void main() {
     tiled_offset += ComputeSurfaceAddrFromCoordMicroTiled(x, y, slice, pitch, height, 0);
 #endif
 
+#if TILE_DEPTH_IMAGE
+    // Do not read or write row/height padding outside the Vulkan image. The old copy
+    // did not initialize these pixels either; preserve their existing guest-buffer bytes.
+    ivec2 extent = textureSize(depth_image, 0);
+    if (slice != 0 || x >= uint(extent.x) || y >= uint(extent.y)) return;
+    tiled_data[tiled_offset / BYTES_PER_PIXEL] =
+        floatBitsToUint(texelFetch(depth_image, ivec2(x, y), 0).r);
+#else
     if (IS_TILER != 0) {
         tiled_data[tiled_offset / BYTES_PER_PIXEL] = linear_data[gl_GlobalInvocationID.x];
     } else {
         linear_data[gl_GlobalInvocationID.x] = tiled_data[tiled_offset / BYTES_PER_PIXEL];
     }
+#endif
 }

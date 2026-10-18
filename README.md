@@ -1,103 +1,92 @@
-# Bloodborne for Windows
+# Bloodborne PC — RTX 3060 6 GB edition
 
-**Bloodborne running natively on Windows 10 and 11, by [Supermedo](https://github.com/Supermedo) Mohammed Albarghouthi.**
+**A Windows performance fork focused on consistent 1080p gameplay on a 6 GB laptop GPU.**
+Tested through extended gameplay on an i7-11800H, 32 GB RAM and RTX 3060 Laptop 6 GB.
+The final profile targets 72 real FPS, with object motion vectors and DLSS K;
+Quality and a custom 75% Ultra Quality mode are available. This freezes the
+user-tested classic renderer with selected fixes rather than a wholesale upstream rebase.
 
-The original PlayStation 4 game runs directly on your PC: its own x86-64 code runs natively,
-and the graphics are translated to Vulkan. No emulator window, no setup scripts: unpack the zip,
-start `Bloodborne.exe`, pick your game folder and press **PLAY**.
+[Download Windows release](https://github.com/rfn9617/bloodborne_pc-rtx-3060/releases/tag/rtx3060-final-2026-10-18)
+· [Русский](docs/README-RU.md)
+· [Measurements](docs/PERFORMANCE.md)
+· [Known issues](docs/KNOWN-ISSUES.md)
+· [Engineering handbook](docs/ENGINEERING-HANDBOOK.md)
 
-**[Download the latest version](https://github.com/Supermedo/bloodborne_pc/releases/latest)** · **[Join the Discord](https://discord.gg/yTMG8c4Bqm)**
+## What makes this build different
 
-> **No game files are included.** You need your own decrypted dump of Bloodborne
-> (CUSA03173). Version 1.09 is needed for the community patches (60/90/unlocked FPS,
-> resolution, effects); other versions run at 30 FPS.
-> This project is not affiliated with Sony Interactive Entertainment or FromSoftware.
+- **Camera and motion correctness first.** Largest-scene camera selection and
+  same-draw constant snapshots address the sewer reconstruction path. The accepted
+  fast path removes repeated CPU camera scans while retaining object vectors.
+- **Conservative occlusion culling.** Real visibility queries, mapping/backing
+  ownership checks, asynchronous writeback validation and fail-visible handling.
+  In the user's matched heavy view, windows went from about 76.5 to 83.0 FPS
+  uncapped: approximately **+8.6%**. This is a local result, not a game-wide promise.
+- **Less avoidable CPU/GPU work.** Retains the inherited threaded recording and
+  palette-hash fast paths, direct DLSS output/sharpening path, depth tile fusion,
+  safe scheduler handover and GPU-safe resource retirement. The change inventory
+  distinguishes inherited features from this fork's later work.
+- **DLSS Ultra Quality at 75% per axis.** 1440×810 nominal input at 1920×1080;
+  the game can align the scene to 1440×812. This uses explicit custom dimensions,
+  not an official NVIDIA NGX UltraQuality enum.
+- **Practical image settings.** Original AO, object vectors ON, extra alpha mip
+  sharpening OFF, accepted Mensis bloom guard, motion blur/jitter OFF. Quality
+  remains selectable for a lower rendering cost.
+- **Evidence retained.** Accepted/rejected experiments, known defects and reusable
+  port-development notes are documented. Another player's cache or saves are not required.
 
-## Features
+## Install and play
 
-- **Launcher with every setting in one window**, in 13 languages: English, Arabic, Russian,
-  Spanish, Portuguese, French, German, Italian, Polish, Turkish, Chinese, Japanese, Korean.
-- **Updates from the launcher:** when a new version is out it tells you, and **Update**
-  installs it. Your saves, settings and mods are kept.
-- **NVIDIA DLSS** on GeForce RTX cards (RTX 20 series and newer).
-- **AMD FSR 3.1 and FSR 4** upscaling, plus native-resolution TAA.
-- **Unlocked frame rate** with a frame cap (up to 120 by default), or 30/60/90 FPS.
-- **Output resolutions** from 720p to 4K, presets from Native AA to Ultra Performance.
-- **Cheats page:** never die, stealth, silent footsteps, Rally that never fades, enemy control,
-  and gameplay tweaks (camera distance, no camera auto-rotation, easier running, ragdoll
-  physics).
-- **Game effects** on and off: chromatic aberration, depth of field, motion blur, SSAO, the
-  game's own AA, dynamic light shadows, screen-space reflections, model detail.
-- **Mods and third-party patches**, loaded without changing your game files.
-- **`Play Bloodborne.exe`** starts the game straight away with your saved settings (good for a
-  desktop shortcut or Steam).
-- **Controller and keyboard**, an in-game settings menu (Insert or L3+R3), name entry on
-  screen, a desktop shortcut, and a button to clear the shader cache.
+1. Extract the release to a writable directory. Keep an existing installation
+   separate when first trying it.
+2. Open `Bloodborne.exe`, select your own decrypted Bloodborne 1.09 game directory
+   and save the launcher settings.
+3. Use **`Play RTX3060.cmd`** for the frozen final profile. The normal launcher
+   also uses the final renderer. **Insert** opens in-game settings.
 
-## Requirements
+Default: 1080p / DLSS K Ultra Quality / 72 FPS / Mailbox / one frame ahead / FG OFF.
+Choose Quality if a scene is GPU-limited. Mailbox does not guarantee a new frame
+on every refresh; 72 real FPS on a 144 Hz display repeats frames. Neither 144 real
+FPS nor guaranteed 72 FPS in every scene is promised.
 
-- Windows 10 (1903 or later) or Windows 11, 64-bit
-- A graphics card with Vulkan 1.3 and a current driver
-- About 6 GB of free memory (RAM + page file), 10 GB for 1440p or 4K output
-- DLSS: NVIDIA GeForce RTX 20 series or newer
+**Game files, saves, personal mods, account settings, caches and gameplay captures
+are not included.** You supply the game. Back up your own saves/settings before
+switching installations. Local finalization preserved the tester's progress in place.
 
-Nothing else to install: everything the game needs is in the zip.
+An older accepted **FG preview** remains optional. It has the display-format and
+object-motion guards, but clothing pulses, overhead and occasional artifacts are
+unresolved. It is OFF by default, has no Reflex, and lacks later ordinary-renderer
+changes. Use `Play FG preview.cmd` only to try that preserved experiment.
 
-## How to play
+## Status
 
-1. Download the zip from [Releases](https://github.com/Supermedo/bloodborne_pc/releases/latest)
-   and unpack it anywhere.
-2. Start `Bloodborne.exe`.
-3. On **Game & effects**, choose your game folder (the one with `eboot.bin`).
-4. Press **PLAY**.
+This is **not a fastest-build claim**: there is no controlled comparison of every
+community fork on matching settings. Rare brief black/geometry flashes, persistent
+blur after some reloads, blood/decal artifacts and small residual glow flicker
+remain open. VRAM cleanup improved in observed gameplay, but complete leak
+elimination or empty menu VRAM is not established. Read [known issues](docs/KNOWN-ISSUES.md).
 
-In the game, **Insert** (or **L3+R3** on a controller) opens the settings menu.
-Keyboard: WASD move, arrows camera, Space Cross, Left Shift Circle, E Square, Q Triangle,
-1/3 L1/R1, R/F L2/R2, Z/C L3/R3, I/K/J/L d-pad, Enter Options, Tab touchpad.
+CACAO was rejected for flatter environmental lighting and is absent from the
+final renderer. A fresh upstream-base transplant was also rejected locally.
+Material CSE/UBO/clip fusion and several copy/binding experiments did not establish
+a useful gain and remain disabled. These decisions are part of the project record.
 
-## Known issues
+## Source and contributions
 
-- The character preview on the character creation screen stays empty. The character is
-  created correctly and looks right in the game.
-- Some AMD graphics cards still crash when the game world loads; fixes are in progress.
-- Above about 120 FPS the game's movement slows down (a limit of the game itself): keep the
-  frame cap at 120 or lower.
+Classic base: `e372481574ec097506fb8f729636afb09ebfa27c`, plus this branch's changes.
+The release identifies the accepted executable by SHA-256. A clean rebuild is
+tested separately and not silently substituted for the user's tested binary.
+See [provenance](docs/SOURCE-PROVENANCE.md), [changes](docs/CHANGELOG-RTX3060.md)
+and [Windows build instructions](packaging/windows/README.md).
 
-## Problems and feedback
+Start contributions with the [experiment template](docs/EXPERIMENT-TEMPLATE.md):
+matched view, frame times, configuration and a visual check. A clean Vulkan log
+does not prove a correct image; percentages from different scenes do not add up.
 
-Ask on the [Discord server](https://discord.gg/yTMG8c4Bqm), or open an [issue](https://github.com/Supermedo/bloodborne_pc/issues) and attach
-`user\last_run.log` from the game folder, with your graphics card and what happened.
-If the game shows only a black screen, try **Advanced → Clear shader cache** first.
+## Credits and license
 
-## Building from source
-
-See [packaging/windows/README.md](packaging/windows/README.md): MSYS2 CLANG64, `bash build.sh`,
-then `bash packaging/windows/package.sh`. DLSS is built separately with
-`packaging/windows/build_dlss.sh`.
-
-## Credits
-
-Built on [bbport](https://github.com/deadinside28/bloodborne_pc), the native Linux port of
-Bloodborne by deadinside28, and on the [shadPS4](https://github.com/shadps4-emu/shadPS4)
-renderer. The original README is in [docs/original-readme](docs/original-readme/README.md).
-
-Also used: [FSR-Vulkan](https://github.com/FireBurn/FSR-Vulkan) and the AMD FidelityFX SDK
-(FSR), FSR 4 assets from [FireBurn/Q2RTX](https://github.com/FireBurn/Q2RTX), the DLSS bridge
-adapted from [IFreemz/shadPS4-Bloodborne-DLSS-FSR](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR),
-the [NVIDIA DLSS SDK](https://github.com/NVIDIA/DLSS) (`nvngx_dlss.dll` under NVIDIA's license),
-[LibAtrac9](https://github.com/Thealexbarney/LibAtrac9), [SDL3](https://github.com/libsdl-org/SDL),
-[FFmpeg](https://ffmpeg.org), [Dear ImGui](https://github.com/ocornut/imgui),
-[sirit](https://github.com/shadps4-emu/sirit), [magic_enum](https://github.com/Neargye/magic_enum),
-[miniz](https://github.com/richgel999/miniz), [xbyak](https://github.com/herumi/xbyak),
-[Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator),
-[MSYS2](https://www.msys2.org) / [LLVM](https://llvm.org), [PyInstaller](https://pyinstaller.org)
-and [Pillow](https://python-pillow.org). Game patches by Kyo, Lance McDonald, auser1337,
-illusion, emoose and the Bloodborne community.
-
-NVIDIA, GeForce RTX and DLSS are trademarks of NVIDIA Corporation. The icon is original
-artwork.
-
-## License
-
-GNU GPL v2 or later ([LICENSE](LICENSE)). Third-party components keep their own licenses
-(see `licenses\` in the download).
+Based on the Bloodborne PC/runtime and Windows-port community, including the
+shadPS4-derived renderer, Windows integration, FSR-Vulkan and their contributors.
+Original documentation/attribution: [UPSTREAM-README.md](docs/UPSTREAM-README.md).
+See [LICENSE](LICENSE); third-party notices accompany the binary. Local profiling,
+adaptation, testing and the RTX3060 release were maintained in this fork.
+NVIDIA DLSS is an optional separately licensed runtime.

@@ -128,6 +128,7 @@ void BufferCache::RunGuestCopy(const BbCopy::Item& item) {
 // Small guest copies run on the recording thread (it spins for work: no wakeup, and it is
 // idle most of the time); PoolSmallCopies (toggle 524288) batches them for the copy threads.
 void BufferCache::SmallGuestCopy(const BbCopy::Item& item) {
+    scheduler.NoteHostCopySource(item.source, item.size);
     if (scheduler.IsRecordingDeferred() && !BbToggle::Disabled(BbToggle::PoolSmallCopies)) {
         scheduler.RecordHostCopy([item] { item.run(item); });
         return;
@@ -384,6 +385,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
             if (staging.size < Chunk) {
                 SmallGuestCopy(item);
             } else {
+                scheduler.NoteHostCopySource(item.source, item.size);
                 BbCopy::Async([item] { item.run(item); });
             }
         }
@@ -609,6 +611,9 @@ const Buffer* BufferCache::UploadCopies(const Buffer* arena, std::span<vk::Buffe
         auto group = std::make_shared<Group>();
         u64 group_bytes = 0;
         const auto launch = [&] {
+            for (const auto& copy : *group) {
+                scheduler.NoteHostCopySource(copy.source, copy.size);
+            }
             BbCopy::Async([group, memory = memory, staging] {
                 for (const auto& copy : *group) {
                     memory->CopySparseMemory(copy.source, copy.destination, copy.size);

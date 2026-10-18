@@ -63,6 +63,8 @@ float base_scale = 1.0f;
 // Present rate for the FPS counter.
 std::chrono::steady_clock::time_point last_present{};
 float frame_ms_avg = 0.0f;
+u32 displayed_slots = 1;
+float present_delta_ms = 1000.0f / 60.0f;
 
 void SetOpen(bool value) {
     if (menu_open.exchange(value) == value) {
@@ -483,6 +485,9 @@ void FpsCounter() {
                 : s.upscaler == BbSettings::UpscalerTaa ? "TAA"
                 : s.upscaler == BbSettings::UpscalerDlss ? "DLSS"
                                                          : "");
+    if (displayed_slots == 2) {
+        ImGui::Text("FG x2: %.0f FPS total (submission rate)", frame_ms_avg > 0.0f ? 2000.0f / frame_ms_avg : 0.0f);
+    }
     // bbport: video memory in use against the driver's budget for this process, about twice a
     // second (a driver query). Orange above 90%: textures start to spill into system memory.
     if (overlay_instance && overlay_instance->CanReportMemoryUsage()) {
@@ -592,6 +597,49 @@ bool HandleEvent(const SDL_Event& event) {
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP: {
         const bool down = event.type == SDL_EVENT_KEY_DOWN;
+        if (down && !event.key.repeat && event.key.key == SDLK_F8 &&
+            BbStats::BlurDiagnosticsEnabled()) {
+            const unsigned seq = BbStats::blur_snapshot_seq.fetch_add(
+                1, std::memory_order_relaxed) + 1;
+            const char* lights = std::getenv("BB_LIGHT_DIAGNOSTICS");
+              const char* post = std::getenv("BB_POSTPROCESS_DIAGNOSTICS");
+              if (post && post[0] == '1' && !(lights && lights[0] == '1')) {
+                  std::printf(seq <= 3 ? "Postprocess snapshot %u requested (F8, next complete post chain)\n"
+                                       : "Postprocess snapshot %u rejected: three-snapshot limit\n", seq);
+                  return true;
+              }
+            if (lights && lights[0] == '1') {
+                // Pair the bounded image series with one command-stream snapshot.
+                // No frame-picture recorder or continuous GPU profiler is needed.
+                if (seq == 1) {
+                    BbStats::snapshot_seq.fetch_add(1, std::memory_order_relaxed);
+                }
+                const char* hdr = std::getenv("BB_LIGHT_HDR_DIAGNOSTICS");
+                if (seq == 1 && hdr && hdr[0] == '1') {
+                    std::printf("Glow capture requested (F8, 64 consecutive HDR/depth/LDR ROI samples and one pass snapshot)\n");
+                } else {
+                    std::printf(seq == 1 ? "Light capture requested (F8, ten input/output pairs and one pass snapshot)\n"
+                                         : "Light capture rejected: one-series process limit\n");
+                }
+                return true;
+            }
+            std::printf(seq <= 4 ? "Blur snapshot %u requested (F8, one frame)\n"
+                                 : "Blur snapshot %u rejected: four-snapshot limit\n", seq);
+            return true;
+        }
+        if (down && !event.key.repeat && event.key.key == SDLK_F9) {
+            const char* motion_capture=std::getenv("BB_FG_MOTION_CAPTURE");
+            if(motion_capture && motion_capture[0]=='1') {
+                BbStats::fg_motion_capture_seq.fetch_add(1,std::memory_order_relaxed);
+                // Combined diagnosis: pair the clip with scene inputs and pass metadata.
+                const char* combined=std::getenv("BB_DIAGNOSTIC_COMBINED");
+                if(combined && combined[0]=='1') {
+                    const unsigned seq=BbStats::snapshot_seq.fetch_add(1,std::memory_order_relaxed)+1;
+                    std::printf("Snapshot %u requested with F9 clip\n",seq);
+                }
+                return true;
+            }
+        }
         // bbport: F9 saves the next seconds of the picture (BB_FRAME_PICTURES, diagnostics).
         if (down && !event.key.repeat && event.key.key == SDLK_F9 &&
             std::getenv("BB_FRAME_PICTURES")) {
@@ -699,14 +747,20 @@ void SetTextEntry(bool active, const std::string& prompt, const std::string& tex
     text_entry_text = text;
 }
 
-void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
-    // Present interval for the FPS readout (measured also while nothing is drawn).
+void NotePresentFrame(u32 slots) {
+    displayed_slots = slots;
+    // One measurement per real frame; the generated slot is not another simulation frame.
     const auto now = std::chrono::steady_clock::now();
     const float ms = std::chrono::duration<float, std::milli>(now - last_present).count();
     last_present = now;
     if (ms > 0.0f && ms < 1000.0f) {
         frame_ms_avg = frame_ms_avg == 0.0f ? ms : frame_ms_avg * 0.95f + ms * 0.05f;
     }
+    present_delta_ms = ms;
+}
+
+void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
+    const float ms = present_delta_ms / displayed_slots;
     if (!Visible()) {
         return;
     }

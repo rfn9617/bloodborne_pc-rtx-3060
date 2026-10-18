@@ -33,7 +33,18 @@ struct Entry {
     std::vector<std::pair<Target, bool>> sampled; ///< textures (false) and storage images (true)
     std::string note;
     std::vector<std::string> buffers; ///< dumped constants, per draw
+    std::vector<std::string> detailed_draws;
 };
+
+bool Detailed() {
+    static const bool enabled=[] {
+        const char* value=std::getenv("BB_CAPTURE_DRAW_DETAILS");
+        return value && value[0]=='1';
+    }();
+    return enabled;
+}
+size_t detail_bytes=0;
+bool detail_truncated=false;
 
 // GPU thread only.
 std::vector<Entry> entries;
@@ -51,6 +62,8 @@ void AddBuffers(Entry& entry) {
     pending_buffers.clear();
 }
 bool pass_open = false;
+u32 postprocess_request = 0;
+u64 postprocess_serial = 0;
 std::mutex display_mutex;
 std::vector<VAddr> display_buffers;
 // bbport: read on every draw; the game registers a handful of display buffers once.
@@ -95,6 +108,11 @@ void Write(VAddr presented) {
         return;
     }
     std::fprintf(f, "presented buffer %#llx\n", static_cast<unsigned long long>(presented));
+    if (postprocess_request)
+        std::fprintf(f, "postprocess request %u command-stream frame %llu\n", postprocess_request,
+                     static_cast<unsigned long long>(postprocess_serial));
+    if(Detailed()) std::fprintf(f,"draw detail bytes %zu; truncated %u; snapshot %u\n",detail_bytes,
+                               u32(detail_truncated),BbStats::snapshot_seq.load());
     u32 index = 0;
     for (const auto& e : entries) {
         if (e.compute) {
@@ -122,6 +140,7 @@ void Write(VAddr presented) {
         for (const auto& b : e.buffers) {
             std::fprintf(f, "%s\n", b.c_str());
         }
+        for (const auto& draw : e.detailed_draws) std::fprintf(f,"%s\n",draw.c_str());
     }
     std::fclose(f);
     std::printf("Frame capture: %zu passes written to %s\n", entries.size(), path.c_str());
@@ -149,6 +168,18 @@ void FrameCapture::OnFlip(VAddr presented_address) {
         state.store(Armed, std::memory_order_release);
         std::printf("Frame capture: armed\n");
     }
+}
+
+void FrameCapture::BeginPostprocessSnapshot(u32 request, u64 frame_serial) {
+    entries.clear();
+    pending_sampled.clear();
+    pending_buffers.clear();
+    pass_open = false;
+    detail_bytes = 0;
+    detail_truncated = false;
+    postprocess_request = request;
+    postprocess_serial = frame_serial;
+    state.store(Recording, std::memory_order_release);
 }
 
 void FrameCapture::Poll() {}
@@ -197,6 +228,8 @@ void FrameCapture::BeginPass(const VideoCore::ImageInfo* const* colors, u32 num_
     if (display && new_pass) {
         if (state.load(std::memory_order_relaxed) == Recording) {
             Write(last_presented.load(std::memory_order_relaxed));
+            postprocess_request = 0;
+            postprocess_serial = 0;
             entries.clear();
             pending_sampled.clear();
             pending_buffers.clear();
@@ -207,6 +240,8 @@ void FrameCapture::BeginPass(const VideoCore::ImageInfo* const* colors, u32 num_
         pending_sampled.clear();
         pending_buffers.clear();
         pass_open = false;
+        detail_bytes=0;
+        detail_truncated=false;
         state.store(Recording, std::memory_order_release);
     }
     if (state.load(std::memory_order_relaxed) != Recording) {
@@ -231,6 +266,19 @@ void FrameCapture::Draw(u64 vs_hash, u64 ps_hash, u32 num_indices, u32 num_insta
     auto& e = entries.back();
     ++e.draws;
     e.indices += u64(num_indices) * std::max(num_instances, 1u);
+    // Capture each draw's descriptors/constants instead of only the first draws
+    // of the pass. Bound the output; this path is off outside an armed snapshot.
+    if(Detailed() && detail_bytes < 32u*1024u*1024u) {
+        std::string detail=std::format("  DRAW {} vs {:016x} ps {:016x} indices {} instances {}",
+                                       e.draws,vs_hash,ps_hash,num_indices,num_instances);
+        for(const auto& [target,storage] : pending_sampled)
+            detail+=std::format("\n    {} {}",storage?"writes":"samples",Describe(target));
+        for(const auto& buffer : pending_buffers) detail+="\n"+buffer;
+        if(detail_bytes+detail.size() <= 32u*1024u*1024u) {
+            detail_bytes+=detail.size();
+            e.detailed_draws.push_back(std::move(detail));
+        } else detail_truncated=true;
+    } else if(Detailed()) detail_truncated=true;
     AddShader(e, vs_hash);
     AddShader(e, ps_hash);
     AddSampled(e);

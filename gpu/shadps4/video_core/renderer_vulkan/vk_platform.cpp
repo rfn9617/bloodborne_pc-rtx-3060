@@ -171,6 +171,9 @@ std::vector<const char*> GetInstanceExtensions(Frontend::WindowSystemType window
 
     switch (window_type) {
     case Frontend::WindowSystemType::Headless:
+        // Headless renderer tests create the same swapchain-capable device.
+        // VK_KHR_swapchain still requires this instance extension without a surface.
+        extensions.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
         break;
 #if defined(VK_USE_PLATFORM_WIN32_KHR)
     case Frontend::WindowSystemType::Windows:
@@ -334,7 +337,7 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
         },
         vk::LayerSettingEXT{
             .pLayerName = VALIDATION_LAYER_NAME,
-            .pSettingName = "syncval_submit_time_validation",
+            .pSettingName = "syncval_full_validation",
             .type = vk::LayerSettingTypeEXT::eBool32,
             .valueCount = 1,
             .pValues = &enable_sync,

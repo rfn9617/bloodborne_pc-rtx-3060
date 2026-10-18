@@ -30,6 +30,8 @@ void UpdateTextInput(SDL_Window* window);
 bool Visible();
 
 /// Present thread: draws into `view` (layout ColorAttachmentOptimal).
+void NotePresentFrame(u32 displayed_slots);
+
 void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent);
 
 /// The menu is open or a text entry is shown: the game's input is held neutral.

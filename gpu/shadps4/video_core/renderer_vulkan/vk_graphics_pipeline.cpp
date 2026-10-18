@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <utility>
+#include "video_core/renderer_vulkan/vertex_input_format.h"
 #include <boost/container/small_vector.hpp>
 
 #include "common/assert.h"
@@ -13,6 +14,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/renderer_vulkan/material_uniforms.h"
 
 namespace Vulkan {
 
@@ -38,6 +40,8 @@ GraphicsPipeline::GraphicsPipeline(
       fetch_shader{std::move(fetch_shader_)} {
     const vk::Device device = instance.GetDevice();
     std::ranges::copy(infos, stages.begin());
+    const u32 fragment = u32(Shader::SwStage::Fragment);
+    has_emulated_clip_distance = infos[fragment] && runtime_infos[fragment].hw.fs.clip_distance_emulation;
     BuildDescSetLayout(preloading);
     const auto debug_str = GetDebugString();
 
@@ -443,10 +447,11 @@ void GraphicsPipeline::GetVertexInputs(
     for (const auto& attrib : fetch_shader->attributes) {
         const auto step_rate = attrib.GetStepRate();
         const auto buffer = attrib.GetSharp(vs_info);
+        const auto [data_format, num_format] = VertexInputDescriptorFormat(buffer);
         attributes.push_back(Attribute{
             .location = attrib.semantic,
             .binding = attrib.semantic,
-            .format = LiverpoolToVK::SurfaceFormat(buffer.GetDataFmt(), buffer.GetNumberFmt()),
+            .format = LiverpoolToVK::SurfaceFormat(data_format, num_format),
             .offset = 0,
         });
         bindings.push_back(Binding{
@@ -491,13 +496,15 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
             continue;
         }
         const auto stage_bit = LogicalStageToStageBit[u32(stage->sw_stage)];
+        u32 buffer_index = 0;
         for (const auto& buffer : stage->buffers) {
             const auto sharp =
                 preloading ? AmdGpu::Buffer{}
                            : buffer.GetSharp(*stage); // See for the comment in compute PL creation
             bindings.push_back({
                 .binding = binding++,
-                .descriptorType = vk::DescriptorType::eStorageBuffer,
+                .descriptorType = MaterialUniforms::Use(*stage, buffer_index++, instance)
+                    ? vk::DescriptorType::eUniformBuffer : vk::DescriptorType::eStorageBuffer,
                 .descriptorCount = 1,
                 .stageFlags = stage_bit,
             });

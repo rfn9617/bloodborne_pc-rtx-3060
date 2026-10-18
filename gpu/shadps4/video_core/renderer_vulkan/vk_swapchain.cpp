@@ -10,6 +10,7 @@
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
+#include "video_core/renderer_vulkan/vk_frame_generator.h"
 
 namespace Vulkan {
 
@@ -74,6 +75,8 @@ void Swapchain::Create(u32 width_, u32 height_) {
     ASSERT_MSG(swapchain_result == vk::Result::eSuccess, "Failed to create swapchain: {}",
                vk::to_string(swapchain_result));
     swapchain = chain;
+    present_id = last_present_id = 0;
+    present_wait_disabled = false;
 
     SetupImages();
     RefreshSemaphores();
@@ -127,8 +130,23 @@ bool Swapchain::AcquireNextImage() {
     return !needs_recreation;
 }
 
+void Swapchain::WaitPreviousPresent() {
+    if (!instance.SupportsPresentWait() || !last_present_id || present_wait_disabled) return;
+    // Do not leave an occluded/minimized window stuck in an unbounded host wait.
+    const auto result = instance.GetDevice().waitForPresentKHR(swapchain, last_present_id, 100'000'000);
+    if (result == vk::Result::eErrorOutOfDateKHR || result == vk::Result::eErrorSurfaceLostKHR) {
+        needs_recreation = true;
+    } else if (result != vk::Result::eSuccess && result != vk::Result::eSuboptimalKHR) {
+        LOG_WARNING(Render_Vulkan, "FG present wait disabled for this swapchain: {}", vk::to_string(result));
+        present_wait_disabled = true;
+    }
+}
+
 bool Swapchain::Present() {
+    const u64 id = ++present_id;
+    const vk::PresentIdKHR present_ids{.swapchainCount = 1, .pPresentIds = &id};
     const vk::PresentInfoKHR present_info = {
+        .pNext = instance.SupportsPresentWait() ? &present_ids : nullptr,
         .waitSemaphoreCount = 1,
         .pWaitSemaphores = &present_ready[image_index],
         .swapchainCount = 1,
@@ -144,6 +162,7 @@ bool Swapchain::Present() {
                    vk::to_string(result));
     }
 
+    if (result == vk::Result::eSuccess || result == vk::Result::eSuboptimalKHR) last_present_id = id;
     frame_index = (frame_index + 1) % image_count;
 
     return !needs_recreation;
@@ -198,6 +217,11 @@ void Swapchain::FindPresentMode() {
         return;
     }
 
+    if(FrameGenerator::Requested()) {
+        present_mode=vk::PresentModeKHR::eFifo;
+        std::printf("Frame generation presentation: FIFO V-Sync, generated then real; game simulation rate unchanged\n");
+        return;
+    }
     const auto requested_mode = EmulatorSettings.GetPresentMode();
     if (requested_mode == "Mailbox") {
         present_mode = vk::PresentModeKHR::eMailbox;
@@ -235,7 +259,7 @@ void Swapchain::SetSurfaceProperties() {
     }
 
     // Select number of images in swap chain, we prefer one buffer in the background to work on
-    image_count = capabilities.minImageCount + 1;
+    image_count = capabilities.minImageCount + (FrameGenerator::Requested()?2u:1u);
     if (capabilities.maxImageCount > 0) {
         image_count = std::min(image_count, capabilities.maxImageCount);
     }

@@ -265,13 +265,13 @@ void Save() {
 }
 
 float PresetScale(int preset) {
-    static constexpr float scales[PresetCount] = {1.0f, 1.5f, 1.7f, 2.0f, 3.0f};
+    static constexpr float scales[PresetCount] = {1.0f, 1.5f, 1.7f, 2.0f, 3.0f, 4.0f / 3.0f};
     return scales[std::clamp(preset, 0, PresetCount - 1)];
 }
 
 const char* PresetName(int preset) {
     static constexpr const char* names[PresetCount] = {"Native AA", "Quality", "Balanced",
-                                                       "Performance", "Ultra Performance"};
+                                                       "Performance", "Ultra Performance", "Ultra Quality (75%)"};
     return names[std::clamp(preset, 0, PresetCount - 1)];
 }
 

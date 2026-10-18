@@ -77,6 +77,9 @@ if [[ -n $profile ]]; then
     [[ $minimal == 0 ]] || args+=(--minimal)
     python3 scripts/windows_profile.py "${args[@]}"
     cp packaging/windows/RTX3060-6GB.md "$dest/"
+    cp packaging/windows/final-play.py "$dest/scripts/rtx3060_play.py"
+    cp "packaging/windows/Play RTX3060.cmd" "$dest/"
+    python3 packaging/windows/write_final_manifest.py "$dest"
     # --play and direct run.py must receive the same renderer defaults as the launcher.
     python3 - "$dest" <<'PY'
 import sys

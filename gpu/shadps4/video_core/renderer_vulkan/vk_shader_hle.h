@@ -16,6 +16,9 @@ namespace Vulkan {
 
 class Rasterizer;
 
+/// Opt-in metadata only, no image readback or per-region logging.
+void PrintMultiCopyRegionStats(double window);
+
 /// Attempts to execute a shader using HLE if possible.
 bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,
                       const AmdGpu::ComputeProgram& cs_program, Rasterizer& rasterizer);

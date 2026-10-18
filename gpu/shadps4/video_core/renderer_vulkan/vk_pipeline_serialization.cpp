@@ -12,12 +12,13 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/renderer_vulkan/material_uniforms.h"
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 static constexpr u32 ShaderBinaryVersion = 7u; // bbport: interpolated integer fix (Pascal)
-static constexpr u32 ShaderMetaVersion = 8u; // bbport: persist has_discard for alpha detail
-static constexpr u32 PipelineKeyVersion = 6u; // bbport: preloaded shaders need the new metadata
+static constexpr u32 ShaderMetaVersion = 9u; // bbport: reject old SRT walkers with permanent zero patches
+static constexpr u32 PipelineKeyVersion = 7u; // bbport: require non-poisoning SRT metadata
 } // namespace Serialization
 
 namespace Vulkan {
@@ -100,9 +101,11 @@ void RegisterMotionAddresses(u64 pgm_hash, size_t perm_idx) {
     }
     const u64 params = Shader::MotionVectors::params_address;
     const u64 positions = Shader::MotionVectors::positions_address;
-    std::vector<u8> data(16);
+    std::vector<u8> data(20);
     std::memcpy(data.data(), &params, 8);
     std::memcpy(data.data() + 8, &positions, 8);
+    const u32 stride = Shader::MotionVectors::position_stride;
+    std::memcpy(data.data() + 16, &stride, 4);
     Storage::DataBase::Instance().Save(Storage::BlobType::MotionAddresses,
                                        fmt::format("{:#018x}_{}", pgm_hash, perm_idx),
                                        std::move(data));
@@ -263,6 +266,11 @@ bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive&
 bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     sel.graphics_key.Deserialize(ar);
 
+    // ShaderMeta is saved per program: a motion key can load a plain permutation.
+    // Address repatching cannot make it write motion. Follow upstream f33e761:
+    // motion pipelines are built at first use, not from ambiguous cache metadata.
+    if (sel.graphics_key.motion_vectors) return false;
+
     GraphicsPipeline::SerializationSupport sdata{};
     sdata.Deserialize(ar);
 
@@ -309,6 +317,12 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
         return false;
     }
 
+    // Reject the inverse mismatch too: plain key, last-saved motion metadata.
+    if ((program->info.hw_stage == Shader::HwStage::Vertex &&
+         spec.runtime_info.hw.vs.motion_vectors) ||
+        (program->info.hw_stage == Shader::HwStage::Fragment &&
+         spec.runtime_info.hw.fs.motion_vectors)) return false;
+
     std::vector<u32> spv{};
     const auto blob_name = fmt::format("{:#018x}_{}", program->info.pgm_hash, perm_idx);
     Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary, blob_name, spv);
@@ -322,9 +336,13 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
         std::vector<u8> addresses;
         Storage::DataBase::Instance().Load(Storage::BlobType::MotionAddresses, blob_name,
                                            addresses);
-        if (addresses.size() != 16 || Shader::MotionVectors::positions_address == 0) {
+        if ((addresses.size() != 16 && addresses.size() != 20) ||
+            Shader::MotionVectors::positions_address == 0) {
             return false;
         }
+        u32 stride = 16; // legacy motion blobs always stored vec4
+        if (addresses.size() == 20) std::memcpy(&stride, addresses.data() + 16, 4);
+        if (stride != Shader::MotionVectors::position_stride) return false;
         u64 old_params{}, old_positions{};
         std::memcpy(&old_params, addresses.data(), 8);
         std::memcpy(&old_positions, addresses.data() + 8, 8);
@@ -341,7 +359,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
 
     auto [it_pgm, new_program] = program_cache.try_emplace(program->info.pgm_hash);
     if (new_program) {
-        module = CompileSPV(spv, instance.GetDevice());
+        module = MaterialUniforms::Compile(program->info, spec.start.unified, spv, instance);
         it_pgm.value() = std::move(program);
     } else {
         const auto& it = std::ranges::find(it_pgm.value()->modules, spec, &Program::Module::spec);
@@ -359,7 +377,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
             }
             module = it->module;
         } else {
-            module = CompileSPV(spv, instance.GetDevice());
+            module = MaterialUniforms::Compile(program->info, spec.start.unified, spv, instance);
         }
     }
     it_pgm.value()->InsertPermut(module, std::move(spec), perm_idx);

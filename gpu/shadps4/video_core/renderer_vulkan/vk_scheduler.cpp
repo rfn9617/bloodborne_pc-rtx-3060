@@ -21,6 +21,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "bbport_threads.h"
+extern "C" int runtime_memory_copy_key(uintptr_t address, uint64_t size, uint64_t* key);
 
 namespace Vulkan {
 
@@ -28,6 +29,10 @@ std::mutex Scheduler::submit_mutex;
 
 Scheduler::Scheduler(const Instance& instance, bool threaded_recording)
     : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore} {
+    const char* copy_wait_mode = std::getenv("BB_HOST_COPY_WAITS");
+    host_copy_ranges = copy_wait_mode && std::strcmp(copy_wait_mode, "range") == 0;
+    std::printf("Host copy waits: %s (fences and submissions retain full waits)\n",
+                host_copy_ranges ? "range" : "all");
     // bbport: BB_VK_RECORD_THREAD=0 records on the calling thread.
     const char* env = std::getenv("BB_VK_RECORD_THREAD");
     if (threaded_recording && !(env && env[0] == '0')) {
@@ -213,7 +218,29 @@ void Scheduler::WaitDeferredSignals() {
     }
 }
 
+void Scheduler::WaitHostCopiesFor(u64 address, u64 size) {
+    u64 key = 0;
+    if (host_copy_ranges && runtime_memory_copy_key(address, size, &key) &&
+        !host_copy_sources.NeedsWait(key, size)) {
+        BbStats::host_copy_waits_skipped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    BbStats::host_copy_range_waits.fetch_add(1, std::memory_order_relaxed);
+    WaitHostCopies();
+}
+
+void Scheduler::NoteHostCopySource(u64 address, u64 size) {
+    if (!host_copy_ranges || !size) return;
+    u64 key = 0;
+    if (runtime_memory_copy_key(address, size, &key)) {
+        host_copy_sources.Note(key, size);
+    } else {
+        host_copy_sources.Note(0, ~u64{0}); // unknown source can alias any write
+    }
+}
+
 void Scheduler::WaitHostCopies() {
+    const u64 sources_seen = host_copy_ranges ? host_copy_sources.Snapshot() : 0;
     if (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
         BbStats::WaitTimer timer{BbStats::host_copies_wait_ns};
         BbStats::host_copy_waits.fetch_add(1, std::memory_order_relaxed);
@@ -224,6 +251,7 @@ void Scheduler::WaitHostCopies() {
     }
     BbStats::WaitTimer timer{BbStats::copy_threads_wait_ns};
     BbCopy::WaitAsync();
+    if (host_copy_ranges) host_copy_sources.Complete(sources_seen);
 }
 
 void Scheduler::KickRecording(bool force) {
@@ -239,14 +267,19 @@ void Scheduler::KickRecording(bool force) {
     if (full_chunks.empty() && record_chunk->Empty()) {
         return;
     }
+    // Acquire outside recorder_mutex, then swap before publishing the old chunk.
+    // A guest-memory fault handler can record on this thread during handover;
+    // it must never see a null record_chunk (upstream 0.5, issue #100).
+    auto next_chunk = record_chunk->Empty() ? nullptr : AcquireChunk();
     bool wake;
     {
         std::scoped_lock lk{recorder_mutex};
         for (auto& chunk : full_chunks) {
             recorder_queue.push_back(std::move(chunk));
         }
-        if (!record_chunk->Empty()) {
-            recorder_queue.push_back(std::move(record_chunk));
+        if (next_chunk) {
+            record_chunk.swap(next_chunk);
+            recorder_queue.push_back(std::move(next_chunk));
         }
         wake = recorder_sleeping;
         queued_chunks.store(recorder_queue.size(), std::memory_order_release);
@@ -255,9 +288,6 @@ void Scheduler::KickRecording(bool force) {
     // A busy recorder picks the new chunks up by itself: waking it is a syscall per draw.
     if (wake) {
         recorder_cv.notify_one();
-    }
-    if (!record_chunk) {
-        record_chunk = AcquireChunk();
     }
 }
 

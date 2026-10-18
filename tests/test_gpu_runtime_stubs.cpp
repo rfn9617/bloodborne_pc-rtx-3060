@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <setjmp.h>
 #include "bbport_toggles.h"
+#include "runtime_occlusion.h"
 // Renderer tests have no guest process. Clock/host-thread services work; guest accesses abort.
 extern "C" {
 int runtime_test_fake_memory = 0; // Explicitly enabled only by sparse-residency GPU tests.
@@ -19,10 +20,35 @@ unsigned runtime_toggle_phase = 0;
 #ifdef _WIN32
 int bb_setjmp(sigjmp_buf) { std::abort(); }
 #endif
+void runtime_memory_read_backing(uintptr_t a, void* p, uint64_t n) {
+    if (runtime_test_fake_memory != 3) std::abort();
+    __builtin_memcpy(p,reinterpret_cast<void*>(a),n);
+}
+int runtime_memory_occlusion_capture(uintptr_t a, uint64_t n, RuntimeOcclusionStamp* stamp) {
+    if (runtime_test_fake_memory != 3) std::abort();
+    if (a < runtime_test_memory_base || n > runtime_test_memory_size ||
+        a - runtime_test_memory_base > runtime_test_memory_size - n) return 0;
+    *stamp={1,a};return 1;
+}
+int runtime_memory_occlusion_write(uintptr_t a,uint32_t pipes,const RuntimeOcclusionStamp* stamp,
+                                  int previous,uint64_t old,uint64_t total) {
+    RuntimeOcclusionStamp now{};
+    if (!runtime_memory_occlusion_capture(a,16ull*(pipes-1)+8,&now) ||
+        now.allocation!=stamp->allocation || now.physical!=stamp->physical) return 0;
+    auto* p=reinterpret_cast<uint64_t*>(a);
+    for (uint32_t k=0;k<pipes;++k)
+        if (p[k*2] && !(previous && p[k*2]==((old/pipes+(k<old%pipes))|(1ull<<63)))) return 0;
+    for (uint32_t k=0;k<pipes;++k) p[k*2]=(total/pipes+(k<total%pipes))|(1ull<<63);
+    return 1;
+}
 uint64_t runtime_tsc_frequency() { return 1000000000; }
 void runtime_file_stats(uint64_t out[5]) { for (int i = 0; i < 5; ++i) out[i] = 0; }
 int runtime_file_translate(const char*, char*, size_t) { std::abort(); }
 uint64_t runtime_memory_clamp(uintptr_t, uint64_t size) { if (runtime_test_fake_memory) return size; std::abort(); }
+int runtime_memory_copy_key(uintptr_t address, uint64_t, uint64_t* key) {
+    if (runtime_test_fake_memory) { *key = address; return 1; }
+    std::abort();
+}
 uint64_t runtime_process_time_us() { return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 int runtime_memory_region(uintptr_t address, uintptr_t* start, uintptr_t* end, int* mapped) {
     if (runtime_test_fake_memory == 2 && address >= runtime_test_memory_base &&

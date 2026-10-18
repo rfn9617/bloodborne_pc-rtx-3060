@@ -8,6 +8,7 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_bind_helper.h"
+#include "video_core/renderer_vulkan/ring_binding_cursor.h"
 #include "video_core/renderer_vulkan/vk_camera_motion.h"
 #include "video_core/renderer_vulkan/vk_constant_ring.h"
 #include "video_core/renderer_vulkan/vk_scene_resolution.h"
@@ -17,6 +18,7 @@
 #include "video_core/renderer_vulkan/vk_draw_prep.h"
 #include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/renderer_vulkan/vk_occlusion.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
 
@@ -92,6 +94,11 @@ public:
         DrainDrawPipe();
         scheduler.WaitHostCopies();
     }
+    void WaitHostCopiesFor(VAddr address, u64 size) {
+        // Publish all sources from prior draw packets before checking their overlap.
+        DrainDrawPipe();
+        scheduler.WaitHostCopiesFor(address, size);
+    }
 
     /// bbport: GPU command thread: waits until the draw recording thread has recorded every
     /// draw handed to it (vk_draw_pipe.h); no-op on other threads.
@@ -122,6 +129,12 @@ public:
     /// Stage A: guest memory the recording thread will write for work handed to it (storage
     /// buffers, DMA, WriteData, fences); constants overlapping it are bound there, not copied here.
     void NotePendingGpuWrite(VAddr address, u64 size);
+    Occlusion* GetOcclusion() const noexcept { return occlusion.get(); }
+    void NoteIssuedDraw() { if (occlusion) occlusion->NoteIssued(); }
+    void FlushOcclusionIfPending() {
+        DrainDrawPipe();
+        if (occlusion && occlusion->HasUnsubmittedDumps(scheduler.CurrentTick())) scheduler.Flush();
+    }
     /// Before a guest-visible write: fences deferred earlier are written first.
     void WaitDeferredSignals() {
         scheduler.WaitDeferredSignals();
@@ -518,6 +531,7 @@ private:
     std::unique_ptr<ConstantRing> constant_ring;
     /// Submissions (prepared draws) kept alive until stage B reaches the position.
     std::deque<std::pair<u64, std::shared_ptr<const void>>> pipe_keepalive;
+    std::unique_ptr<Occlusion> occlusion;
     std::unique_ptr<DrawPipe> draw_pipe;
 };
 

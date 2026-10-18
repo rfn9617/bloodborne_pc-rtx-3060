@@ -190,7 +190,7 @@ DLSS_MODELS = [('auto', ('Auto (driver default)', 'Авто (выбор драй
                ('j', ('J: transformer, less ghosting', 'J: transformer, меньше гостинга')),
                ('l', ('L: newer, heavier', 'L: новее, тяжелее')), ('m', ('M: newer, heavier', 'M: новее, тяжелее'))]
 PRESETS = [('0', ('Native AA (×1.0)',)), ('1', ('Quality (×1.5)',)), ('2', ('Balanced (×1.7)',)),
-           ('3', ('Performance (×2)',)), ('4', ('Ultra Performance (×3)',))]
+           ('3', ('Performance (×2)',)), ('4', ('Ultra Performance (×3)',)), ('5', ('Ultra Quality (75%)',))]
 OUTPUTS = [('1280x720', ('1280 × 720 (Steam Deck)',)), ('1920x1080', ('1920 × 1080',)),
            ('2560x1440', ('2560 × 1440',)), ('3840x2160', ('3840 × 2160 (4K)',))]
 LIVE = [('auto', ('Auto (by graphics card)', 'Авто (по видеокарте)')), ('0', ('Off (faster)', 'Выключена (быстрее)')),

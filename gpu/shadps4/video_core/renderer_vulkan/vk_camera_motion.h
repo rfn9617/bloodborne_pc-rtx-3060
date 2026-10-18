@@ -66,6 +66,14 @@ public:
     // Current projection, previous projection, and row Z of previous-view * inverse-view.
     [[nodiscard]] std::array<std::array<float, 4>, 3> TaaDepthParameters() const noexcept;
 
+    // Current view-to-world basis, captured with the same scene constants as motion.
+    std::array<std::array<float, 3>, 4> FrameGenerationCamera() const noexcept {
+        return {{{current.inv_view[3],current.inv_view[7],current.inv_view[11]},
+                 {current.inv_view[1],current.inv_view[5],current.inv_view[9]},
+                 {current.inv_view[0],current.inv_view[4],current.inv_view[8]},
+                 {current.inv_view[2],current.inv_view[6],current.inv_view[10]}}};
+    }
+
     /// Records the motion vector pass: `depth_view` (depth aspect, General layout) into
     /// `motion_view` (RG16F storage, General), pixels, previous minus current.
     void RecordMotion(vk::CommandBuffer cmdbuf, vk::ImageView depth_view, vk::ImageView motion_view,
@@ -85,6 +93,8 @@ public:
     /// The pass copying the finished frame (`frame`, the last target drawn) to the display: the
     /// frame's depth and camera are complete. Records the debug overlay, starts a new frame.
     void OnDisplayPass(VideoCore::ImageId frame);
+    /// Sparse CPU-only state report for long-session blur diagnostics.
+    void ReportBlurState() const;
 
 private:
     struct Camera {

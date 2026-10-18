@@ -8,6 +8,7 @@
  * encode 40-bit addresses, so host-default 0x7f... addresses would not fit. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "../gpu/shim/runtime_occlusion.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,7 +50,8 @@ static uint64_t pool_size_bytes(void) {
 #define MAP_NO_OVERWRITE 0x80
 enum { KIND_RESERVED=1, KIND_DIRECT, KIND_FLEXIBLE };
 typedef struct { uint64_t start, size; int type, used; } Block;
-typedef struct { uintptr_t start, end; int kind, prot, type; uint64_t phys; } Vma;
+typedef struct { uintptr_t start, end; int kind, prot, type; uint64_t phys, allocation; } Vma;
+static uint64_t next_mapping_allocation;
 typedef struct {
     uintptr_t start, end; uint64_t offset; int32_t protection, memory_type;
     uint32_t flags; char name[32];
@@ -380,7 +382,7 @@ static int32_t place(void **inout, uint64_t size, int prot, int flags, uint64_t 
     if (host_map(address,size,host_prot(prot),kind==KIND_RESERVED,phys)) return NO_MEMORY;
     void *mapped=(void *)address;
     drop_range(address,address+size);
-    if (vma_insert(vma_index(address),(Vma){address,address+size,kind,prot,type,phys})) return NO_MEMORY;
+    if (vma_insert(vma_index(address),(Vma){address,address+size,kind,prot,type,phys,++next_mapping_allocation})) return NO_MEMORY;
     if (kind==KIND_FLEXIBLE) flexible_bytes+=size;
     if (kind!=KIND_RESERVED) queue_hook(HOOK_MAP,address,size);
     *inout=mapped;
@@ -796,9 +798,74 @@ int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t s
     read_unlock();
     return ok;
 }
+/* Query writeback never faults into the GPU thread. Mapping identities survive
+ * protection changes/splits, but change on unmap/remap, including the same VA/PA.
+ * All words are prevalidated under the VMA lock before any compare/exchange. */
+int runtime_memory_occlusion_capture(uintptr_t address, uint64_t extent, RuntimeOcclusionStamp *stamp) {
+    if (!stamp) return 0;
+    memset(stamp,0,sizeof(*stamp));
+    if (!extent || extent>256 || address%8 || extent>UINTPTR_MAX-address) return 0;
+    read_lock();
+    size_t i=vma_index(address);
+    int ok=backing_base && i<vma_count && vmas[i].start<=address &&
+           vmas[i].kind!=KIND_RESERVED && extent<=vmas[i].end-address;
+    if (ok) *stamp=(RuntimeOcclusionStamp){vmas[i].allocation,vmas[i].phys+address-vmas[i].start};
+    read_unlock();
+    return ok;
+}
+void runtime_memory_read_backing(uintptr_t address, void *data, uint64_t size) {
+    memset(data,0,size);
+    if (size>UINTPTR_MAX-address) return;
+    read_lock();
+    for (uintptr_t at=address,end=address+size;at<end;) {
+        size_t i=vma_index(at);
+        if (!backing_base || i==vma_count) break;
+        if (vmas[i].start>at) { at=vmas[i].start<end?vmas[i].start:end;continue; }
+        uint64_t n=(vmas[i].end<end?vmas[i].end:end)-at;
+        if (vmas[i].kind!=KIND_RESERVED) memcpy((unsigned char*)data+at-address,backing_base+vmas[i].phys+at-vmas[i].start,n);
+        at+=n;
+    }
+    read_unlock();
+}
+static uint64_t occlusion_share(uint64_t total,uint32_t pipes,uint32_t k) {
+    return (total/pipes+(k<total%pipes)) | (UINT64_C(1)<<63);
+}
+int runtime_memory_occlusion_write(uintptr_t address,uint32_t pipes,const RuntimeOcclusionStamp *stamp,
+                                   int has_previous,uint64_t previous,uint64_t total) {
+    if (!stamp || !stamp->allocation || !pipes || pipes>16 || address%8) return 0;
+    uint64_t extent=16ull*(pipes-1)+8;
+    if (extent>UINTPTR_MAX-address) return 0;
+    read_lock();
+    size_t i=vma_index(address);
+    int ok=backing_base && i<vma_count && vmas[i].start<=address && vmas[i].kind!=KIND_RESERVED &&
+           extent<=vmas[i].end-address && vmas[i].allocation==stamp->allocation &&
+           vmas[i].phys+address-vmas[i].start==stamp->physical;
+    uint64_t old[16], value[16];
+    uint64_t *words=ok?(uint64_t*)(backing_base+stamp->physical):NULL;
+    for (uint32_t k=0;ok && k<pipes;++k) {
+        old[k]=__atomic_load_n(words+2*k,__ATOMIC_ACQUIRE);
+        value[k]=occlusion_share(total,pipes,k);
+        if (old[k]!=0 && !(has_previous && old[k]==occlusion_share(previous,pipes,k))) ok=0;
+    }
+    uint32_t committed=0;
+    for (;ok && committed<pipes;++committed) {
+        uint64_t expected=old[committed];
+        if (!__atomic_compare_exchange_n(words+2*committed,&expected,value[committed],0,__ATOMIC_RELEASE,__ATOMIC_RELAXED)) {
+            ok=0; break;
+        }
+    }
+    if (!ok) while (committed) {
+        --committed;
+        uint64_t expected=value[committed];
+        __atomic_compare_exchange_n(words+2*committed,&expected,old[committed],0,__ATOMIC_RELEASE,__ATOMIC_RELAXED);
+    }
+    read_unlock();
+    return ok;
+}
+
 /* Per-thread cache of recently found regions for the GPU's per-draw queries:
  * entries hold for as long as the table generation they were read at. */
-typedef struct { uint64_t generation; uintptr_t start, end; int kind; } CachedRegion;
+typedef struct { uint64_t generation; uintptr_t start, end; int kind; uint64_t phys; } CachedRegion;
 static __thread CachedRegion region_cache[8];
 static __thread unsigned region_cache_next;
 static const CachedRegion *cached_region(uintptr_t address) {
@@ -814,7 +881,27 @@ static const CachedRegion *cached_region(uintptr_t address) {
 static void cache_region(size_t i) {
     uint64_t generation=__atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
     if (i==vma_count || (generation & 1)) return;
-    region_cache[region_cache_next++ % 8]=(CachedRegion){generation,vmas[i].start,vmas[i].end,vmas[i].kind};
+    region_cache[region_cache_next++ % 8]=(CachedRegion){generation,vmas[i].start,vmas[i].end,vmas[i].kind,vmas[i].phys};
+}
+/* A copy dependency key names the backing bytes, not the virtual address: direct
+ * mappings may alias. Unknown or multi-VMA ranges require a conservative full wait. */
+int runtime_memory_copy_key(uintptr_t address, uint64_t size, uint64_t *key) {
+    if (!size || !key || size > UINTPTR_MAX-address) return 0;
+    const CachedRegion *c=(runtime_disabled_optimizations & 1) ? NULL : cached_region(address);
+    if (c && c->kind!=KIND_RESERVED && size<=c->end-address) {
+        *key=c->phys+(address-c->start);
+        return 1;
+    }
+    read_lock();
+    size_t i=vma_index(address);
+    int ok=i<vma_count && vmas[i].start<=address && vmas[i].kind!=KIND_RESERVED &&
+           size<=vmas[i].end-address;
+    if (ok) {
+        *key=vmas[i].phys+(address-vmas[i].start);
+        cache_region(i);
+    }
+    read_unlock();
+    return ok;
 }
 /* Mapped length from address, up to size, across adjacent mappings. */
 uint64_t runtime_memory_clamp(uintptr_t address, uint64_t size) {

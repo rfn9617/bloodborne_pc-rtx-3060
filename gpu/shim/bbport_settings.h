@@ -15,7 +15,7 @@ enum Upscaler : int { UpscalerOff = 0, UpscalerFsr3 = 1, UpscalerFsr4 = 2, Upsca
 inline bool IsFsr4(int upscaler) {
     return upscaler == UpscalerFsr4 || upscaler == UpscalerFsr411;
 }
-enum Preset : int { NativeAA = 0, Quality, Balanced, Performance, UltraPerformance, PresetCount };
+enum Preset : int { NativeAA = 0, Quality, Balanced, Performance, UltraPerformance, UltraQuality, PresetCount };
 /// DLSS models (NVSDK_NGX_DLSS_Hint_Render_Preset, ini dlss_model): 0 lets the driver choose per
 /// quality mode. J/K: transformer models (DLSS 4), K recommended; L/M: newer transformer models
 /// (the driver's own choice for Ultra Performance / Performance). All are heavier than the old

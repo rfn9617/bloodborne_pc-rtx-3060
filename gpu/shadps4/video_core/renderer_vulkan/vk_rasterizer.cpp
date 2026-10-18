@@ -18,9 +18,11 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/material_uniforms.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
+#include "video_core/renderer_vulkan/vk_frame_generator.h"
 #include "bbport_threads.h"
 #include "bbport_settings.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -67,6 +69,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         liverpool->BindRasterizer(this);
     }
     memory->SetRasterizer(this);
+    occlusion = Occlusion::Create(instance, scheduler);
 
     GpuProfiler::Init(instance, scheduler);
     if (DrawPipeWanted()) {
@@ -81,7 +84,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     });
 }
 
-Rasterizer::~Rasterizer() = default;
+Rasterizer::~Rasterizer() {
+    if (draw_pipe) draw_pipe->Drain(DrawPipe::ReasonRasterizer);
+    if (occlusion) scheduler.Finish();
+    occlusion.reset();
+}
 
 inline const AmdGpu::Regs& Rasterizer::Regs() const {
     return stage_regs ? *stage_regs : liverpool->regs;
@@ -455,6 +462,7 @@ void Rasterizer::NotePendingGpuWrite(VAddr address, u64 size) {
 }
 
 bool Rasterizer::CanCaptureGuestBuffer(VAddr address, u64 size) {
+    if (occlusion && occlusion->MayWriteGuestBuffer(address, size)) return false;
     return pending_writes.CanSnapshot(
         address, size, [&](u64 position) { return draw_pipe->Reached(position); },
         [&] { return buffer_cache.IsRegionGpuModified(address, size); });
@@ -913,6 +921,7 @@ bool Rasterizer::FilterDrawPasses() const {
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* prepared) {
     RENDERER_TRACE;
+    NoteIssuedDraw();
     BbStats::draws.fetch_add(1, std::memory_order_relaxed);
 
     // bbport: with the draw pipeline this thread only selects the pipeline and hands the draw
@@ -967,6 +976,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         FrameCapture::IsDisplayBuffer(regs.color_buffers[0].Address())) {
         scene_started = false;
         if (camera_motion->HasFrameCamera()) last_scene_frame = std::chrono::steady_clock::now();
+        upscaler->CaptureBlurDisplay(cb_descs[0].first);
         camera_motion->OnDisplayPass(cb_descs[0].first);
         if (upscaler->OnFrameStart()) {
             object_motion->InvalidateHistory();
@@ -1052,7 +1062,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             const auto buffer = resource.GetSharp(vs);
             const u32 size = buffer.GetSize();
             if (!buffer.Valid() || buffer.GetStride() != 16) continue;
-            const auto role = Motion::ClassifyBuffer(size);
+            const auto role = Motion::ClassifyBuffer(size, vs.pgm_hash);
             if (role == Motion::BufferRole::Skeleton) {
                 gated = false;
                 break;
@@ -1144,6 +1154,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         (regs.num_indices > 6 || regs.num_instances.NumInstances() > 1)) {
         draw_jitter = upscaler->Jitter();
     }
+    if (occlusion && occlusion->SkipDraw()) { ResetBindings(false); return; }
     UpdateDynamicState(pipeline, is_indexed);
     MarkPass(pipeline, state);
     scheduler.BeginRendering(state);
@@ -1158,14 +1169,62 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     const u32 num_instances = regs.num_instances.NumInstances();
     const u32 first_vertex = vertex_offset;
     const u32 first_instance = instance_offset;
+    const auto query = occlusion ? occlusion->BeginDraw(push_data.scene_size) : Occlusion::DrawQuery{};
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
+        if (query.pool) cmdbuf.beginQuery(query.pool, query.index, query.flags);
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
         if (is_indexed) {
             cmdbuf.drawIndexed(num_indices, num_instances, 0, s32(first_vertex), first_instance);
         } else {
             cmdbuf.draw(num_indices, num_instances, first_vertex, first_instance);
         }
+        if (query.pool) cmdbuf.endQuery(query.pool, query.index);
     });
+    // Render the same final game display shader into a scratch target, replacing
+    // only the reconstructed UI texture with its pre-UI snapshot. All samplers,
+    // constants, channel swizzles, vertex data, viewport and final color mapping
+    // are identical to the real display draw. Never replay geometry or a shader
+    // with storage side effects; unsupported passes keep ordinary presentation.
+    if(FrameGenerator::Requested() && regs.color_buffers[0] &&
+       FrameCapture::IsDisplayBuffer(regs.color_buffers[0].Address()) &&
+       state.num_color_attachments==1 && !db_desc.first && num_indices<=6 && num_instances==1 &&
+       !regs.blend_control[0].enable) {
+        bool writes_storage=false;
+        for(const auto* stage:pipeline->GetStages()) if(stage) {
+            for(const auto& buffer:stage->buffers) writes_storage|=buffer.is_written;
+            for(const auto& image:stage->images) writes_storage|=image.is_written;
+        }
+        if(!writes_storage) {
+            std::vector<std::pair<size_t,vk::ImageView>> originals;
+            for(size_t i=0;i<image_infos.size();++i) {
+                if(const auto view=upscaler->HudlessDisplaySample(image_infos[i].imageView)) {
+                    originals.emplace_back(i,image_infos[i].imageView);
+                    image_infos[i].imageView=view;
+                }
+            }
+            if(!originals.empty()) {
+                auto& generator=upscaler->GetFrameGenerator();
+                if(const auto target=generator.BeginDisplayReplay(cb_descs[0].second.view_info.format)) {
+                    auto replay=state;
+                    replay.color_attachments[0].image_view=target;
+                    replay.color_attachments[0].image_layout=vk::ImageLayout::eGeneral;
+                    replay.color_attachments[0].is_clear=true;
+                    replay.color_attachments[0].clear_value={};
+                    pipeline->BindResources(set_writes,push_data);
+                    scheduler.BeginRendering(replay);
+                    scheduler.Record([=](vk::CommandBuffer cmd) {
+                        cmd.bindPipeline(vk::PipelineBindPoint::eGraphics,handle);
+                        if(is_indexed) cmd.drawIndexed(num_indices,num_instances,0,s32(first_vertex),first_instance);
+                        else cmd.draw(num_indices,num_instances,first_vertex,first_instance);
+                    });
+                    generator.EndDisplayReplay();
+                    static bool reported=false;
+                    if(!reported) {std::printf("Frame generation: HUD-less final-display shader replay active\n"); reported=true;}
+                }
+            }
+            for(const auto& [i,view]:originals) image_infos[i].imageView=view;
+        }
+    }
     if (FrameCapture::Active()) {
         const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
         FrameCapture::Draw(vs_info.pgm_hash, ps ? ps->pgm_hash : 0, num_indices, num_instances);
@@ -1178,6 +1237,34 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                           u32(regs.depth_control.depth_write_enable));
             FrameCapture::Note(note);
         }
+        static const bool draw_details=[] {
+            const char* value=std::getenv("BB_CAPTURE_DRAW_DETAILS");
+            return value && value[0]=='1';
+        }();
+        if(draw_details) {
+            const auto& bc=regs.blend_control[0];
+            char note[512];
+            std::snprintf(note,sizeof(note),"\n  DRAW_STATE draw vs %016llx ps %016llx idx %u first_vertex %u first_instance %u motion_param %u blend %u src %u dst %u func %u separate_alpha %u alpha_src %u alpha_dst %u alpha_func %u depth_test %u depth_write %u depth_func %u",
+                (unsigned long long)vs_info.pgm_hash,(unsigned long long)(ps?ps->pgm_hash:0),
+                num_indices,first_vertex,first_instance,push_data.motion_param,u32(bc.enable),
+                u32(bc.color_src_factor),u32(bc.color_dst_factor),u32(bc.color_func),
+                u32(bc.separate_alpha_blend),u32(bc.alpha_src_factor),u32(bc.alpha_dst_factor),
+                u32(bc.alpha_func),u32(regs.depth_control.depth_enable),
+                u32(regs.depth_control.depth_write_enable),u32(regs.depth_control.depth_func));
+            FrameCapture::Note(note);
+            std::snprintf(note,sizeof(note),
+                "\n  DRAW_PROJECTION vs %016llx ps %016llx scene_depth %u clip_disabled %u jitter %.9g %.9g target_scale %.9g %.9g viewport %.9g %.9g %.9g %.9g",
+                (unsigned long long)vs_info.pgm_hash,(unsigned long long)(ps?ps->pgm_hash:0),
+                u32(db_desc.first && db_desc.first==camera_motion->Depth()),
+                u32(regs.IsClipDisabled()),draw_jitter[0],draw_jitter[1],
+                target_scale[0],target_scale[1],regs.viewports[0].xoffset,
+                regs.viewports[0].yoffset,regs.viewports[0].xscale,regs.viewports[0].yscale);
+            FrameCapture::Note(note);
+        }
+    }
+    if (state.num_color_attachments == 1 && num_instances == 1 && num_indices <= 6) {
+        const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        if (ps) upscaler->CapturePostprocessDraw(ps->pgm_hash, cb_descs[0].first);
     }
     DebugState.IncDrawCall();
 
@@ -1189,6 +1276,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                               u32 max_count, VAddr count_address, u16 vertex_sgpr_offset,
                               u16 instance_sgpr_offset) {
     RENDERER_TRACE;
+    NoteIssuedDraw();
     // bbport: like direct draws, handed to the recording thread after the pipeline selection
     // (else the GPU thread waited here for a whole frame of queued draws).
     const bool pipelined = UseDrawPipe() && FilterDrawPasses() &&
@@ -1272,6 +1360,7 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     if (upscaler->Enabled() && db_desc.first && db_desc.first == camera_motion->Depth()) {
         draw_jitter = upscaler->Jitter();
     }
+    if (occlusion && occlusion->SkipDraw()) { ResetBindings(false); return; }
     UpdateDynamicState(pipeline, is_indexed);
     MarkPass(pipeline, state);
     scheduler.BeginRendering(state);
@@ -1283,7 +1372,9 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     const u64 args_offset = base;
     const vk::Buffer counts = count_address != 0 ? count_buffer->Handle() : vk::Buffer{};
     const u64 counts_offset = count_address != 0 ? count_offset : 0;
+    const auto query = occlusion ? occlusion->BeginDraw(push_data.scene_size) : Occlusion::DrawQuery{};
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
+        if (query.pool) cmdbuf.beginQuery(query.pool, query.index, query.flags);
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
         if (is_indexed) {
             if (counts) {
@@ -1297,7 +1388,17 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
         } else {
             cmdbuf.drawIndirect(args, args_offset, max_count, stride);
         }
+        if (query.pool) cmdbuf.endQuery(query.pool, query.index);
     });
+    if(FrameCapture::Active()) {
+        const auto* vs=pipeline->GetStages()[u32(Shader::SwStage::Vertex)];
+        const auto* ps=pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        FrameCapture::Draw(vs?vs->pgm_hash:0,ps?ps->pgm_hash:0,0,max_count);
+        char note[192];
+        std::snprintf(note,sizeof(note),"\n  INDIRECT args %#llx count %#llx stride %u max_count %u indexed %u; actual GPU-written counts not read",
+            (unsigned long long)indirect.args,(unsigned long long)count_address,stride,max_count,u32(is_indexed));
+        FrameCapture::Note(note);
+    }
     DebugState.IncDrawCall();
 
     ResetBindings(false);
@@ -2109,13 +2210,34 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                              Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data, u32& write_index) {
     CpuDrawProfile::Section cpu_section(CpuDrawProfile::Phase::Buffers);
-    const u64 alignment = instance.StorageMinAlignment();
+    static const bool cursor_requested = [] {
+        const char* value = std::getenv("BB_RING_BIND_CURSOR");
+        const bool enabled = value && value[0] == '1';
+        std::printf("Ring binding lookup: %s (per-stage, per-draw data unchanged)\n",
+                    enabled ? "monotonic cursor" : "legacy scan");
+        return enabled;
+    }();
+    const RingStage* selected_ring_stage = nullptr;
+    if (cursor_requested) {
+        selected_ring_stage = CpuDrawProfile::Measure<CpuDrawProfile::Phase::RingLookup>([&]() -> const RingStage* {
+            for (u32 i = 0; i < num_ring_stages; ++i) {
+                if (ring_stages[i].info == &stage) return &ring_stages[i];
+            }
+            return nullptr;
+        });
+    }
+    RingBindingCursor<RingBinding> ring_cursor(selected_ring_stage
+        ? std::span<const RingBinding>{selected_ring_stage->bindings, selected_ring_stage->count}
+        : std::span<const RingBinding>{});
     for (u32 buffer_index = 0; buffer_index < stage.buffers.size(); ++buffer_index) {
         const auto& desc = stage.buffers[buffer_index];
+        const bool uniform = MaterialUniforms::Use(stage, buffer_index, instance);
+        const u64 alignment = uniform ? instance.UniformMinAlignment() : instance.StorageMinAlignment();
         CpuDrawProfile::Count(CpuDrawProfile::Counter::Bindings);
         const RingBinding* ring = num_ring_stages
             ? CpuDrawProfile::Measure<CpuDrawProfile::Phase::RingLookup>(
-                  [&] { return FindRingBinding(stage, buffer_index); })
+                  [&] { return cursor_requested ? ring_cursor.Find(buffer_index)
+                                                : FindRingBinding(stage, buffer_index); })
             : nullptr;
         if (ring) {
             CpuDrawProfile::Count(CpuDrawProfile::Counter::Rings);
@@ -2247,7 +2369,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
         set_write.dstBinding = binding.unified++;
         set_write.dstArrayElement = 0;
         set_write.descriptorCount = 1;
-        set_write.descriptorType = vk::DescriptorType::eStorageBuffer;
+        set_write.descriptorType = uniform ? vk::DescriptorType::eUniformBuffer : vk::DescriptorType::eStorageBuffer;
+        if (uniform && buffer_infos.back().buffer) {
+            buffer_infos.back().range = std::min<u64>(buffer_infos.back().range, MaterialUniforms::Capacity);
+        }
         set_write.pBufferInfo = &buffer_infos.back();
         ++binding.buffer;
     }
@@ -3636,11 +3761,16 @@ void Rasterizer::MarkPass(const GraphicsPipeline* pipeline, const RenderState& s
     }
     const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);
     const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+    static const bool clip_profile = [] {
+        const char* value = std::getenv("BB_GPU_PROFILE_CLIP");
+        return value && value[0] == '1';
+    }();
     std::array<u64, AmdGpu::NUM_COLOR_BUFFERS + 6> parts{};
     parts[0] = state.width | u64(state.height) << 32;
     parts[1] = vs.pgm_hash;
     parts[2] = ps ? ps->pgm_hash : 0;
     parts[3] = db_desc.first ? u64(texture_cache.GetImage(db_desc.first).info.pixel_format) : 0;
+    if (clip_profile) parts.back() = pipeline->HasEmulatedClipDistance();
     for (u32 cb = 0; cb < state.num_color_attachments && cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
         parts[4 + cb] = cb_descs[cb].first
                             ? u64(texture_cache.GetImage(cb_descs[cb].first).info.pixel_format) + 1
@@ -3655,12 +3785,13 @@ void Rasterizer::MarkPass(const GraphicsPipeline* pipeline, const RenderState& s
                            : std::string{"-"};
             targets += ' ';
         }
-        return fmt::format("pass {}x{} [{}] depth {} vs {:016x} ps {:016x}", state.width,
+        return fmt::format("pass {}x{} [{}] depth {} vs {:016x} ps {:016x}{}", state.width,
                            state.height, targets,
                            db_desc.first ? vk::to_string(
                                                texture_cache.GetImage(db_desc.first).info.pixel_format)
                                          : std::string{"-"},
-                           vs.pgm_hash, ps ? ps->pgm_hash : 0);
+                           vs.pgm_hash, ps ? ps->pgm_hash : 0,
+                           clip_profile ? (pipeline->HasEmulatedClipDistance() ? " clip emulated" : " clip none") : "");
     });
 }
 

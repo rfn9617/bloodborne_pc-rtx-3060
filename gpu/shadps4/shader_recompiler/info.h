@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cstring>
 #include <span>
 #include <vector>
 #include <boost/container/static_vector.hpp>
@@ -209,15 +210,33 @@ struct Info : InfoPersistent {
     }
 
     template <typename T>
-    T ReadUdReg(u32 ptr_index, u32 dword_offset) const noexcept {
-        T data;
+    T ReadUdReg(u32 ptr_index, u32 dword_offset, bool* has_data = nullptr) const noexcept {
+        if (has_data) {
+            *has_data = false;
+        }
+        T data{};
         const auto ud = UserData();
         const u32* base = ud.data();
         if (ptr_index != IR::NumScalarRegs) {
+            // An absent vertex table can occur while an area unloads. The SRT
+            // walker tolerates it, but CPU fetch specialization reads it too.
+            // Validate both dwords before extracting the tagged 48-bit pointer.
+            if (ptr_index >= ud.size() || ud.size() - ptr_index < 2) {
+                return data;
+            }
             std::memcpy(&base, &ud[ptr_index], sizeof(base));
             base = reinterpret_cast<const u32*>(VAddr(base) & 0xFFFFFFFFFFFFULL);
+            if (VAddr(base) < 0x10000) {
+                return data;
+            }
+        } else if (dword_offset > ud.size() ||
+                   sizeof(T) > (ud.size() - dword_offset) * sizeof(u32)) {
+            return data;
         }
         std::memcpy(&data, base + dword_offset, sizeof(T));
+        if (has_data) {
+            *has_data = true;
+        }
         return data;
     }
 

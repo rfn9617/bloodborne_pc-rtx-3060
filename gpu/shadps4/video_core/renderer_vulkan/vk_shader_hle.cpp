@@ -9,6 +9,10 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/host_shaders/buffer_multi_copy_comp.h"
+#include "video_core/host_shaders/buffer_multi_copy_vector_comp.h"
+#include <cstdio>
+#include <cstdlib>
+#include <atomic>
 #include "bbport_toggles.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 
@@ -18,6 +22,33 @@ namespace Vulkan {
 
 static constexpr u64 COPY_SHADER_HASH = 0xfefebf9f;
 
+static bool CopyRegionStatsEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("BB_MULTI_COPY_STATS");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+struct CopyRegionStats {
+    std::atomic<u64> batches{0}, candidates{0}, regions{0}, small{0}, medium{0}, large{0};
+    std::atomic<u64> bytes{0}, large_bytes{0}, aligned_large_bytes{0}, same_residue{0};
+};
+static CopyRegionStats copy_region_stats;
+
+void PrintMultiCopyRegionStats(double window) {
+    if (!CopyRegionStatsEnabled()) return;
+    auto& s = copy_region_stats;
+    std::printf("Multi-copy regions: %llu batches, %llu vector candidates; %llu regions "
+                "(<256B %llu, 256-1023B %llu, >=1024B %llu); %llu bytes, "
+                "%llu large bytes, %llu aligned large bytes; %llu same mod16; %.1f s\n",
+                (unsigned long long)s.batches.exchange(0), (unsigned long long)s.candidates.exchange(0),
+                (unsigned long long)s.regions.exchange(0), (unsigned long long)s.small.exchange(0),
+                (unsigned long long)s.medium.exchange(0), (unsigned long long)s.large.exchange(0),
+                (unsigned long long)s.bytes.exchange(0), (unsigned long long)s.large_bytes.exchange(0),
+                (unsigned long long)s.aligned_large_bytes.exchange(0),
+                (unsigned long long)s.same_residue.exchange(0), window);
+}
+
 // bbport: the copy shader runs ~57 times per frame with ~1024 small ranges each. As one
 // vkCmdCopyBuffer with that many regions it cost ~37 ns of GPU time per range (~2.1 ms per
 // frame) plus the recording; buffer_multi_copy.comp copies all ranges in one dispatch.
@@ -26,7 +57,14 @@ static bool MultiCopy(Rasterizer& rasterizer, const VideoCore::Buffer* src,
     if (copies.size() < 8 || BbToggle::Disabled(BbToggle::MultiCopyShader)) {
         return false;
     }
+    static const bool vector_requested = [] {
+        const char* value = std::getenv("BB_MULTI_COPY_VECTOR");
+        return value && value[0] == '1';
+    }();
     u64 src_min = ~0ull, src_max = 0, dst_min = ~0ull, dst_max = 0;
+    u64 total_bytes = 0, vector_bytes = 0;
+    const bool region_stats = CopyRegionStatsEnabled();
+    u64 small = 0, medium = 0, large = 0, large_bytes = 0, same_residue = 0;
     for (const auto& copy : copies) {
         if ((copy.srcOffset | copy.dstOffset | copy.size) & 3) {
             return false; // dword copies only
@@ -35,6 +73,17 @@ static bool MultiCopy(Rasterizer& rasterizer, const VideoCore::Buffer* src,
         src_max = std::max(src_max, copy.srcOffset + copy.size);
         dst_min = std::min(dst_min, copy.dstOffset);
         dst_max = std::max(dst_max, copy.dstOffset + copy.size);
+        if (vector_requested || region_stats) {
+            total_bytes += copy.size;
+            if (copy.size >= 1024 && ((copy.srcOffset | copy.dstOffset) & 15) == 0)
+                vector_bytes += copy.size;
+        }
+        if (region_stats) {
+            if (copy.size < 256) ++small;
+            else if (copy.size < 1024) ++medium;
+            else { ++large; large_bytes += copy.size; }
+            if ((copy.srcOffset & 15) == (copy.dstOffset & 15)) ++same_residue;
+        }
     }
     auto& runtime = rasterizer.GetRuntime();
     auto& scheduler = runtime.GetScheduler();
@@ -42,11 +91,28 @@ static bool MultiCopy(Rasterizer& rasterizer, const VideoCore::Buffer* src,
     const u64 align = instance.StorageMinAlignment();
     src_min = Common::AlignDown(src_min, align);
     dst_min = Common::AlignDown(dst_min, align);
+    // Avoid adding a branch to batches dominated by tiny or misaligned copies.
+    const bool use_vector = vector_requested && align >= 16 && vector_bytes != 0 &&
+                            vector_bytes >= (total_bytes + 1) / 2;
+    if (region_stats) {
+        auto& s = copy_region_stats;
+        s.batches.fetch_add(1, std::memory_order_relaxed);
+        s.candidates.fetch_add(align >= 16 && vector_bytes != 0 &&
+                               vector_bytes >= (total_bytes + 1) / 2, std::memory_order_relaxed);
+        s.regions.fetch_add(copies.size(), std::memory_order_relaxed);
+        s.small.fetch_add(small, std::memory_order_relaxed);
+        s.medium.fetch_add(medium, std::memory_order_relaxed);
+        s.large.fetch_add(large, std::memory_order_relaxed);
+        s.bytes.fetch_add(total_bytes, std::memory_order_relaxed);
+        s.large_bytes.fetch_add(large_bytes, std::memory_order_relaxed);
+        s.aligned_large_bytes.fetch_add(vector_bytes, std::memory_order_relaxed);
+        s.same_residue.fetch_add(same_residue, std::memory_order_relaxed);
+    }
 
     struct Pipeline {
         vk::UniqueDescriptorSetLayout set_layout;
         vk::UniquePipelineLayout layout;
-        vk::UniquePipeline pipeline;
+        std::array<vk::UniquePipeline, 2> pipeline;
     };
     static Pipeline pipe = [&] {
         const auto device = instance.GetDevice();
@@ -72,8 +138,10 @@ static bool MultiCopy(Rasterizer& rasterizer, const VideoCore::Buffer* src,
             .pushConstantRangeCount = 1,
             .pPushConstantRanges = &range,
         }));
+        std::printf("Multi-copy shader: %s, 64 lanes, merge policy unchanged\n",
+                    vector_requested ? "adaptive vector16, aligned >=1024 bytes cover >=50% of batch" : "scalar32");
         const auto module = CompileSPV(BUFFER_MULTI_COPY_COMP, device);
-        p.pipeline = Check(device.createComputePipelineUnique(
+        p.pipeline[0] = Check(device.createComputePipelineUnique(
             {}, vk::ComputePipelineCreateInfo{
                     .stage = {.stage = vk::ShaderStageFlagBits::eCompute,
                               .module = module,
@@ -81,6 +149,16 @@ static bool MultiCopy(Rasterizer& rasterizer, const VideoCore::Buffer* src,
                     .layout = *p.layout,
                 }));
         device.destroyShaderModule(module);
+        if (vector_requested) {
+            const auto vector_module = CompileSPV(BUFFER_MULTI_COPY_VECTOR_COMP, device);
+            p.pipeline[1] = Check(device.createComputePipelineUnique(
+                {}, vk::ComputePipelineCreateInfo{
+                        .stage = {.stage = vk::ShaderStageFlagBits::eCompute,
+                                  .module = vector_module, .pName = "main"},
+                        .layout = *p.layout,
+                    }));
+            device.destroyShaderModule(vector_module);
+        }
         return p;
     }();
 
@@ -107,9 +185,13 @@ static bool MultiCopy(Rasterizer& rasterizer, const VideoCore::Buffer* src,
         runtime.FlushBarriers();
     }
     const u32 count = static_cast<u32>(copies.size());
+    if (BbStats::enabled) {
+        (use_vector ? BbStats::multi_copy_vector : BbStats::multi_copy_scalar)
+            .fetch_add(1, std::memory_order_relaxed);
+    }
     scheduler.Record([src = src->Handle(), dst = dst->Handle(), table = stream.Handle(), src_min,
                       src_size, dst_min, dst_size, table_offset, table_size,
-                      count](vk::CommandBuffer cmdbuf) {
+                      count, pipeline = *pipe.pipeline[use_vector ? 1 : 0]](vk::CommandBuffer cmdbuf) {
         const std::array<vk::DescriptorBufferInfo, 3> infos{{
             {src, src_min, src_size},
             {dst, dst_min, dst_size},
@@ -122,7 +204,7 @@ static bool MultiCopy(Rasterizer& rasterizer, const VideoCore::Buffer* src,
                          .descriptorType = vk::DescriptorType::eStorageBuffer,
                          .pBufferInfo = &infos[i]};
         }
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *pipe.pipeline);
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
         cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pipe.layout, 0, writes);
         cmdbuf.pushConstants(*pipe.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(count),
                              &count);

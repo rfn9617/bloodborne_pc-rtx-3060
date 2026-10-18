@@ -89,6 +89,8 @@ struct MotionVectors {
     /// the position array (vec4 per vertex; element 0 is scratch), fixed for the session.
     static inline u64 params_address = 0;
     static inline u64 positions_address = 0;
+    // Opt-in lossless x/y/w history. z is replaced by validity before interpolation.
+    static inline u32 position_stride = 16;
     static constexpr u32 FlagStore = 1;
     static constexpr u32 FlagLoad = 2;
 };

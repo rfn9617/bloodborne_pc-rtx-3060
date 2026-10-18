@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include "video_core/renderer_vulkan/vertex_input_format.h"
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -25,6 +26,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/material_uniforms.h"
 #include "video_core/renderer_vulkan/motion_history.h"
 #include "video_core/renderer_vulkan/vk_draw_prep.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -41,7 +43,7 @@ using Shader::SwStage;
 constexpr static auto SpirvVersion1_6 = 0x00010600U;
 
 constexpr static std::array DescriptorHeapSizes = {
-    vk::DescriptorPoolSize{vk::DescriptorType::eUniformBuffer, 512},
+    vk::DescriptorPoolSize{vk::DescriptorType::eUniformBuffer, 8192},
     vk::DescriptorPoolSize{vk::DescriptorType::eStorageBuffer, 8192},
     vk::DescriptorPoolSize{vk::DescriptorType::eSampledImage, 8192},
     vk::DescriptorPoolSize{vk::DescriptorType::eStorageImage, 1024},
@@ -624,7 +626,7 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
                 if (resource.IsSpecial()) continue;
                 const auto buffer = resource.GetSharp(*vs);
                 if (buffer.Valid() && buffer.GetStride() == 16 &&
-                    Motion::ClassifyBuffer(buffer.GetSize()) != Motion::BufferRole::Other) {
+                    Motion::ClassifyBuffer(buffer.GetSize(), vs->pgm_hash) != Motion::BufferRole::Other) {
                     sel.motion = true;
                     break;
                 }
@@ -637,16 +639,23 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
             return value && value[0] == '1';
         }();
         if (select_log && vs) {
-            std::string sizes;
+            u64 signature = vs->pgm_hash;
             for (const auto& resource : vs->buffers) {
                 if (resource.IsSpecial()) continue;
                 const auto buffer = resource.GetSharp(*vs);
-                sizes += fmt::format(" {}/{}", buffer.GetSize(), buffer.GetStride());
+                const u64 word = u64(buffer.GetSize()) << 32 | buffer.GetStride();
+                signature ^= word + 0x9e3779b97f4a7c15ULL + (signature << 6) + (signature >> 2);
             }
             static std::mutex log_mutex;
             static std::unordered_set<u64> logged;
             std::scoped_lock lock{log_mutex};
-            if (logged.insert(vs->pgm_hash ^ std::hash<std::string>{}(sizes)).second) {
+            if (logged.insert(signature).second) {
+                std::string sizes;
+                for (const auto& resource : vs->buffers) {
+                    if (resource.IsSpecial()) continue;
+                    const auto buffer = resource.GetSharp(*vs);
+                    sizes += fmt::format(" {}/{}", buffer.GetSize(), buffer.GetStride());
+                }
                 std::printf("Motion select: vs %016llx %s, buffers (size/stride):%s\n",
                             static_cast<unsigned long long>(vs->pgm_hash),
                             sel.motion ? "ON " : "off", sizes.c_str());
@@ -835,11 +844,12 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
         u32 vertex_binding = 0;
         for (const auto& attrib : sel.fetch_shader->attributes) {
             const auto& buffer = attrib.GetSharp(*vs_info);
+            const auto [data_format, num_format] = VertexInputDescriptorFormat(buffer);
             ASSERT_MSG(vertex_binding < MaxVertexBufferCount,
                        "Vertex attribute binding count exceeded limit: {} >= {}", vertex_binding,
                        MaxVertexBufferCount);
             key.vertex_buffer_formats[vertex_binding++] =
-                Vulkan::LiverpoolToVK::SurfaceFormat(buffer.GetDataFmt(), buffer.GetNumberFmt());
+                Vulkan::LiverpoolToVK::SurfaceFormat(data_format, num_format);
         }
     }
 
@@ -864,6 +874,7 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     CompileTimer timer;
 
     const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
+    const u32 first_binding = binding.unified;
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
     DumpShader(spv, info.pgm_hash, info.hw_stage, perm_idx, "spv");
 
@@ -875,7 +886,7 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
         LOG_INFO(Loader, "Loaded patch for {} shader {:#x}", info.hw_stage, info.pgm_hash);
         module = CompileSPV(*patch, instance.GetDevice());
     } else {
-        module = CompileSPV(spv, instance.GetDevice());
+        module = MaterialUniforms::Compile(info, first_binding, spv, instance);
     }
 
     RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx);

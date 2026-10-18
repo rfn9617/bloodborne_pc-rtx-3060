@@ -41,7 +41,15 @@ VertexRange IndexedRange(std::span<const Index, Extent> indices, int32_t base_ve
 // (48 bytes per bone). Characters have 656+ bytes; weapons and props 2-8 bones (96-384).
 enum class BufferRole { Other, Skeleton, SmallSkeleton };
 constexpr uint32_t SmallPaletteBytes = 640; ///< SmallSkeleton palettes are smaller
-inline BufferRole ClassifyBuffer(uint32_t size) {
+inline BufferRole ClassifyBuffer(uint32_t size, uint64_t shader = 0) {
+    // Nightmare Frontier: these existing skinned G-buffer shaders bind a 380-bone
+    // (18,240-byte) palette. The old generic 16 KiB cutoff excluded them entirely.
+    // Extend only the observed shader families and complete 3x4 matrices, bounded
+    // to 512 bones; unrelated large constants must not become animated geometry.
+    if (size > 16384 && size <= 512u * 48u && size % 48 == 0 &&
+        (shader == 0x3deaa573u || shader == 0xa7450683u)) {
+        return BufferRole::Skeleton;
+    }
     if (size == 864 || size > 16384) {
         return BufferRole::Other;
     }

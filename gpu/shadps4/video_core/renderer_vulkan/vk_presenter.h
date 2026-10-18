@@ -37,6 +37,10 @@ struct Frame {
     u64 ready_tick;
     bool is_hdr{false};
     u8 id{};
+    vk::Image generated_image{};
+    vk::ImageView generated_view{};
+    VmaAllocation generated_allocation{};
+    bool generated_ready = false;
 
 };
 
@@ -47,6 +51,7 @@ enum SchedulerType {
 };
 
 class Rasterizer;
+class FgMotionCapture;
 
 class Presenter {
 public:
@@ -136,6 +141,7 @@ private:
     std::condition_variable free_cv;
     std::condition_variable_any frame_cv;
     std::vector<VAddr> vo_buffers_addr;
+    std::unique_ptr<FgMotionCapture> fg_motion_capture;
 };
 
 } // namespace Vulkan

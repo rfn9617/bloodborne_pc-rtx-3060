@@ -23,6 +23,9 @@ class FrameCapture {
 public:
     /// VideoOut thread, per flip: frame boundary, presented buffer, trigger file check.
     static void OnFlip(VAddr presented_address);
+    /// GPU thread: capture postprocessing beginning at the exact HDR tap,
+    /// ending at the next display pass; avoids an adjacent-frame metadata dump.
+    static void BeginPostprocessSnapshot(u32 request, u64 frame_serial);
 
     /// VideoOut: a display buffer the game registered. A pass drawing into one starts a frame
     /// in the GPU command stream (the flip itself runs a frame behind).

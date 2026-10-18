@@ -40,6 +40,20 @@ int main() {
     history.NextFrame();
     assert(!history.Prepare(draw).load);
 
+    // A location's history is reusable storage, not permanently occupied slots.
+    History locations(64);
+    for (uint32_t location = 0; location < 10000; ++location) {
+        locations.NextFrame();
+        auto mesh = draw;
+        mesh.geometry = location;
+        const auto allocation = locations.Prepare(mesh);
+        assert(allocation.store && !allocation.load && locations.Used() == 16);
+        assert(!locations.stats.exhausted);
+    }
+    locations.NextFrame();
+    locations.NextFrame(); // menu/no geometry: older location must not be loaded
+    assert(!locations.Prepare(draw).load);
+
     // A changed index buffer may reference formerly unused holes inside the same min/max.
     // Do not accept that history merely because its addresses/counts stayed the same.
     history.NextFrame();
@@ -87,6 +101,16 @@ int main() {
     assert(ClassifyBuffer(96) == BufferRole::SmallSkeleton &&
            ClassifyBuffer(384) == BufferRole::SmallSkeleton);
     assert(ClassifyBuffer(656) == BufferRole::Skeleton && ClassifyBuffer(64) == BufferRole::Other);
+    for (const uint64_t shader : {0x3deaa573u, 0xa7450683u}) {
+        assert(ClassifyBuffer(18240, shader) == BufferRole::Skeleton);
+        assert(ClassifyBuffer(512 * 48, shader) == BufferRole::Skeleton);
+        assert(ClassifyBuffer(18241, shader) == BufferRole::Other);
+        assert(ClassifyBuffer(513 * 48, shader) == BufferRole::Other);
+        assert(ClassifyBuffer(864, shader) == BufferRole::Other);
+        assert(ClassifyBuffer(416, shader) == BufferRole::Other);
+    }
+    assert(ClassifyBuffer(18240) == BufferRole::Other);
+    assert(ClassifyBuffer(18240, 0x9da6aacbu) == BufferRole::Other);
 
     // Index ranges: reused between full scans, rescanned every Revalidate frames, trimmed.
     IndexRangeCache ranges;

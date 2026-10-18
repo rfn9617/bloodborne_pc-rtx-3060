@@ -1,0 +1,50 @@
+{
+  "source_tests": [
+    {
+      "name": "occlusion-memory-test",
+      "exit_code": 0,
+      "seconds": 0.078
+    },
+    {
+      "name": "ultra-quality-test",
+      "exit_code": 0,
+      "seconds": 0.125
+    },
+    {
+      "name": "motion-history-test",
+      "exit_code": 0,
+      "seconds": 0.078
+    },
+    {
+      "name": "pending-guest-writes-test",
+      "exit_code": 0,
+      "seconds": 0.078
+    },
+    {
+      "name": "occlusion-gpu-test",
+      "exit_code": 0,
+      "seconds": 0.5
+    },
+    {
+      "name": "dlss-ultra-quality-test",
+      "exit_code": 0,
+      "seconds": 1.641
+    },
+    {
+      "name": "camera-motion-test",
+      "exit_code": 0,
+      "seconds": 0.437
+    }
+  ],
+  "windows_profile_tests": {
+    "count": 8,
+    "result": "PASS"
+  },
+  "packaged_normal_entry": "PASS",
+  "packaged_legacy_fg_entry": "PASS",
+  "packaged_accepted_vulkan_smoke_without_toolchain_path": "PASS",
+  "clean_source_rebuild": "PASS; tested separately, not substituted for accepted executable",
+  "accepted_render_source_manifest": "23/23 original accepted OC/Ultra Quality file hashes match export",
+  "gameplay_auto_started": false,
+  "renderer_visual_status": "Historical accepted executable; known issues documented"
+}

@@ -95,5 +95,18 @@ int main() {
     bool valid = true;
     assert(motion.PrepareRead(scheduler.CommandBuffer(), 8, 8, valid) && !valid);
     scheduler.Finish();
+    assert(motion.ResidentImages() == 3); // main, auxiliary, tiny fallback
+    for (u32 idle = 0; idle < 602; ++idle) {
+        motion.OnFrameStart();
+        if (idle % 128 == 0) scheduler.Finish();
+    }
+    scheduler.Finish();
+    assert(motion.ResidentImages() == 0);
+    motion.OnFrameStart();
+    assert(draw(64, 3.0f));
+    verify(64, 3.0f);
+    assert(motion.ResidentImages() == 1);
+    scheduler.Finish();
+    std::puts("Object motion: unused attachments retired, recreation and GPU contents PASS");
     std::puts("Object motion: alternating auxiliary/main sizes, persistent GPU data, no switch submits, per-frame clears and exact-size compose PASS");
 }

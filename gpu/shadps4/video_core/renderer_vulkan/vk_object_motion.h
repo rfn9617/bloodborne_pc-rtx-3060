@@ -8,6 +8,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <map>
 #include <memory>
 #include "video_core/renderer_vulkan/motion_history.h"
@@ -30,6 +31,7 @@ public:
     [[nodiscard]] bool Enabled() const noexcept {
         return enabled;
     }
+    [[nodiscard]] size_t ResidentImages() const noexcept { return images.size(); }
 
     using DrawInfo = Motion::Draw;
     u32 PrepareDraw(const DrawInfo& draw);
@@ -71,6 +73,7 @@ private:
         vk::UniqueImageView view;
         bool written = false;
         u64 last_frame = 0;
+        std::chrono::steady_clock::time_point last_use{};
         vk::ImageLayout layout = vk::ImageLayout::eUndefined;
     };
     MotionImage& EnsureImage(u32 width, u32 height);
@@ -83,11 +86,13 @@ private:
     // element 0 all zero (motion off).
     static constexpr u32 FrameSlots = 4;
     static constexpr u32 ParamsPerFrame = 8192;
-    // Positions (device local): two halves (current/previous frame) of vec4; element 0 is reserved.
-    // bbport: 8 Mi vertices (2 x 128 MiB of positions). 4 Mi ran out in heavy places (the
-    // sewers: ~650 draws a frame without their own history, so DLSS saw only camera motion
-    // for them); 8 Mi leaves room on a 6 GB card.
-    static constexpr u32 PositionsPerFrame = 8u << 20;
+    // Positions: two bounded, per-frame arenas; element 0 is reserved. Default 8 Mi
+    // vec4 entries = 256 MiB. Opt-in compact x/y/w keeps all three float32 values
+    // losslessly, allowing 12 Mi entries = 288 MiB. Old draws do not accumulate:
+    // History drops entries each frame and immediately reuses the previous arena.
+    const bool compact_history;
+    const bool diagnostics;
+    const u32 PositionsPerFrame;
     Motion::History history{PositionsPerFrame};
     Motion::IndexRangeCache index_ranges;
     std::array<u64, FrameSlots> params_ticks{};
@@ -99,6 +104,14 @@ private:
 
     u64 frame = 0;
     u32 params_used = 0;
+    u32 peak_vertices = 0, peak_params = 0;
+    u64 param_skips = 0, retired_images = 0;
+    struct InvalidSummary {
+        u64 count = 0;
+        DrawInfo example{};
+    };
+    std::map<u64, InvalidSummary> invalid_by_shader;
+    std::chrono::steady_clock::time_point frame_time{};
     // Auxiliary and main G-buffers can alternate resolutions within every frame.
     // Reuse each attachment instead of draining the GPU and reallocating on every switch.
     std::map<std::pair<u32, u32>, std::unique_ptr<MotionImage>> images;

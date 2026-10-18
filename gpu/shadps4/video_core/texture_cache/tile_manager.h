@@ -26,6 +26,7 @@ class TileManager {
         u32 num_bits;
         u32 num_samples;
         bool is_tiler;
+        bool from_depth = false;
 
         bool operator==(const TilingKey&) const = default;
 
@@ -36,6 +37,7 @@ class TileManager {
                 boost::hash_combine(hash, key.num_bits);
                 boost::hash_combine(hash, key.num_samples);
                 boost::hash_combine(hash, key.is_tiler);
+                boost::hash_combine(hash, key.from_depth);
                 return hash;
             }
         };
@@ -49,6 +51,10 @@ public:
     void TileImage(Image& in_image, std::span<vk::BufferImageCopy> buffer_copies,
                    const VideoCore::Buffer* out_buffer, u64 out_offset);
 
+    /// Experimental fused path. Unsupported copies return false without recording work.
+    bool TryTileDepthImage(Image& image, std::span<const vk::BufferImageCopy> copies,
+                           const Buffer* output, u64 offset);
+
     std::pair<const Buffer*, u64> DetileImage(const VideoCore::Buffer* in_buffer, u64 in_offset,
                                               const ImageInfo& info);
 
@@ -57,7 +63,8 @@ private:
                               const vk::DescriptorBufferInfo& linear,
                               const vk::DescriptorBufferInfo& params, u32 dim_x);
 
-    vk::Pipeline GetTilingPipeline(const ImageInfo& info, bool is_tiler);
+    vk::Pipeline GetTilingPipeline(const ImageInfo& info, bool is_tiler, bool from_depth = false);
+    void EnsureDepthResources();
 
 private:
     const Vulkan::Instance& instance;
@@ -66,6 +73,9 @@ private:
     StreamBuffer& stream_buffer;
     vk::UniqueDescriptorSetLayout desc_layout;
     vk::UniquePipelineLayout pl_layout;
+    vk::UniqueDescriptorSetLayout depth_desc_layout;
+    vk::UniquePipelineLayout depth_pl_layout;
+    vk::UniqueSampler depth_sampler;
     std::unordered_map<TilingKey, vk::UniquePipeline, TilingKey::Hash> tiling_pipelines;
 };
 

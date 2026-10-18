@@ -94,6 +94,7 @@ enum class High : std::uint64_t {
     ReadAfterReadBarriers = 1ull << 1, // 65
     /// The GPU command thread waits as BB_FRAMES_AHEAD says; off: one frame more ahead.
     FramesAheadAsSet = 1ull << 2, // 66
+    DepthTileFusion = 1ull << 3, // 67; only active with BB_DEPTH_TILE_FUSION=1
 };
 inline bool Disabled(High bit) {
     return (__atomic_load_n(&runtime_disabled_optimizations_high, __ATOMIC_RELAXED) &
@@ -125,8 +126,19 @@ inline std::atomic<std::uint64_t> barrier_calls{0}, barrier_images{0};
 inline std::atomic<bool> loading_screen{false};
 /// F9: save the next few seconds of presented frames as pictures (Presenter::PrepareFrame).
 inline std::atomic<bool> frame_burst_request{false};
+/// F9 in the opt-in FG motion diagnostic: consecutive real/generated crops.
+inline std::atomic<std::uint32_t> fg_motion_capture_seq{0};
 /// F10: a diagnostic snapshot (picture, frame analysis, upscaler inputs); +1 per press.
 inline std::atomic<std::uint32_t> snapshot_seq{0};
+/// F8: bounded, single-frame scene diagnostics; does not arm full frame capture.
+inline std::atomic<std::uint32_t> blur_snapshot_seq{0};
+inline bool BlurDiagnosticsEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("BB_BLUR_DIAGNOSTICS");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
 /// This loading screen goes without the frame limit (BB_FAST_LOADING, the present thread).
 inline std::atomic<bool> loading_unlimited{false};
 /// Render pass instances begun (Scheduler::BeginRendering).
@@ -181,6 +193,8 @@ inline std::atomic<std::uint64_t> reduced_draws{0}, scene_draws{0};
 /// for host copies before a submission or fence, and for GPU ticks.
 inline std::atomic<std::uint64_t> sync_recording_ns{0}, host_copies_wait_ns{0}, tick_wait_ns{0},
     copy_threads_wait_ns{0}, host_copy_waits{0};
+inline std::atomic<std::uint64_t> host_copy_waits_skipped{0}, host_copy_range_waits{0};
+inline std::atomic<std::uint64_t> multi_copy_vector{0}, multi_copy_scalar{0};
 struct WaitTimer {
     std::atomic<std::uint64_t>& total;
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();

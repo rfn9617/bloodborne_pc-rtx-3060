@@ -250,6 +250,7 @@ bool PipelinedOpcode(PM4ItOpcode opcode) {
     case PM4ItOpcode::DispatchIndirect:
     case PM4ItOpcode::WriteData:     // run in order on the recording thread (RunInOrder)
     case PM4ItOpcode::DmaData:
+    case PM4ItOpcode::SetPredication:
         return true;
     default:
         return false;
@@ -341,7 +342,8 @@ void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(data);
     // Copies deferred to the recording thread, and fences deferred to it (RecorderFences),
     // precede writes the guest sees.
-    rasterizer.WaitHostCopies();
+    rasterizer.WaitHostCopiesFor(write_data->Address<VAddr>(),
+                                 (header->type3.count.Value() - 2) * sizeof(u32));
     rasterizer.WaitDeferredSignals();
     BbWriteLog::Note(write_data->Address<u64>(), write_data->data,
                      (header->type3.count.Value() - 2) * sizeof(u32), BbWriteLog::WriteData);
@@ -349,6 +351,14 @@ void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
                 (header->type3.count.Value() - 2) * sizeof(u32));
 }
 
+void RunOcclusionDump(Vulkan::Rasterizer& rasterizer, const u8* data) {
+    if (auto* occlusion = rasterizer.GetOcclusion())
+        occlusion->Dump(*reinterpret_cast<const Vulkan::Occlusion::DumpTask*>(data));
+}
+void RunSetPredication(Vulkan::Rasterizer& rasterizer, const u8* data) {
+    if (auto* occlusion = rasterizer.GetOcclusion())
+        occlusion->SetPredication(*reinterpret_cast<const Vulkan::Occlusion::PredicationTask*>(data));
+}
 void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const auto& event_eos = *reinterpret_cast<const PM4CmdEventWriteEos*>(data);
     // Copies deferred to the recording thread precede writes the guest sees.
@@ -925,7 +935,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break; // registers: ApplyGraphicsRegisterPacket
             }
             case PM4ItOpcode::SetPredication: {
-                LOG_WARNING(Render, "Unimplemented IT_SET_PREDICATION");
+                const auto* pred = reinterpret_cast<const u32*>(header);
+                Vulkan::Occlusion::PredicationTask task{};
+                task.block = (u64(pred[2] & 0xFFFF) << 32) | (pred[1] & ~0xFu);
+                task.op = (pred[2] >> 24) & 7;
+                task.draw_if_visible = ((pred[2] >> 16) & 1) == 0;
+                task.cont = (pred[2] >> 31) & 1;
+                if (rasterizer && rasterizer->GetOcclusion())
+                    rasterizer->RunInOrder(&RunSetPredication, &task, sizeof(task));
                 break;
             }
             case PM4ItOpcode::IndexType: {
@@ -1134,6 +1151,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     // registers: ApplyGraphicsRegisterPacket
                 } else if (event->event_index.Value() == EventIndex::ZpassDone) {
                     if (event->event_type.Value() == EventType::PixelPipeStatDump) {
+                        if (rasterizer && rasterizer->GetOcclusion()) {
+                            const auto task = rasterizer->GetOcclusion()->MakeDump(event->Address<VAddr>(), num_counter_pairs);
+                            rasterizer->RunInOrder(&RunOcclusionDump, &task, sizeof(task));
+                        } else {
                         static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
                         static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
                         u64* results = event->Address<u64*>();
@@ -1141,6 +1162,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                             *results = pixel_counter | OcclusionCounterValidMask;
                         }
                         pixel_counter += OcclusionCounterStep;
+                        }
                     }
                 }
                 break;
@@ -1266,6 +1288,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
                         continue;
                     }
+                    if (rasterizer && rasterizer->GetOcclusion()) rasterizer->FlushOcclusionIfPending();
                     YIELD_GFX();
                 }
                 break;

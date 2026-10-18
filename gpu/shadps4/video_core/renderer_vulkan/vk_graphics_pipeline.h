@@ -101,6 +101,7 @@ public:
     const GraphicsPipelineKey& GetGraphicsKey() const {
         return key;
     }
+    bool HasEmulatedClipDistance() const { return has_emulated_clip_distance; }
 
     /// Gets the attributes and bindings for vertex inputs.
     template <typename Attribute, typename Binding>
@@ -115,6 +116,7 @@ private:
 private:
     GraphicsPipelineKey key;
     std::optional<const Shader::Gcn::FetchShaderData> fetch_shader{};
+    bool has_emulated_clip_distance{};
 };
 
 struct ClipDistanceShaderKey {

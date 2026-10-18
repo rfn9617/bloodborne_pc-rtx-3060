@@ -22,6 +22,7 @@
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/renderer_vulkan/vk_dlss.h"
 #include "video_core/renderer_vulkan/vk_fsr4.h"
+#include "video_core/renderer_vulkan/postprocess_capture_budget.h"
 #include "video_core/texture_cache/image.h"
 
 struct FfxVkPortableUpscaleContext;
@@ -37,6 +38,8 @@ class Scheduler;
 class Runtime;
 class CameraMotion;
 class SceneTargets;
+class FrameGenerator;
+class FgMotionCapture;
 
 class TemporalUpscaler {
 public:
@@ -65,6 +68,8 @@ public:
 
     /// Start of a frame in the command stream (display pass).
     bool OnFrameStart();
+    /// Capture the completed scene only after an accepted F8 request; idle is a no-op.
+    void CaptureBlurDisplay(VideoCore::ImageId frame);
     bool RasterScaling() const;
     /// bbport: LOD bias for scene materials, log2(render / output) while a reduced scene is
     /// upscaled (0 at native size, for TAA and without an upscaler).
@@ -89,6 +94,8 @@ public:
     /// spatial background copy and native UI, without needing scene depth or FSR history.
     void OnDraw(u64 vs_hash, VideoCore::ImageId color, VideoCore::ImageId depth,
                 bool native_viewport);
+    // Opt-in bounded readback, after a selected guest postprocessing draw.
+    void CapturePostprocessDraw(u64 ps_hash, VideoCore::ImageId color);
 
     /// A pass's first color target: the last render-size RGBA8 target before the UI is the
     /// game's finished frame.
@@ -121,8 +128,22 @@ public:
         u32 width, height;
     };
     bool DisplayOverride(VAddr address, Display& display);
+    FrameGenerator& GetFrameGenerator() { return *frame_generator; }
+    struct SceneCaptureStamp {
+        u64 frame_id=0;
+        float frame_ms=0;
+        std::array<float,2> jitter{};
+    };
+    SceneCaptureStamp GetSceneCaptureStamp() const { return scene_capture_stamp; }
+    Target FrameGenerationUiFrame();
+    vk::ImageView HudlessDisplaySample(vk::ImageView ui_view);
 
 private:
+    // Opt-in Mensis diagnosis: HDR before guest post, paired with this frame's LDR input.
+    void CaptureLightHdr();
+    int light_hdr_dump = -1;
+    u64 light_frame_serial = 0;
+    PostprocessCaptureBudget postprocess_budget;
     /// bbport: views of guest images the upscaler reads, kept across frames: FSR 4 registers
     /// images by view in a registry of eight (a new view per frame filled it at Native AA).
     vk::ImageView CachedView(const VideoCore::Image& image, vk::Format format,
@@ -138,8 +159,13 @@ private:
     std::array<ViewEntry, 6> view_cache{};
     u64 view_uses = 0;
 
+    std::unique_ptr<FrameGenerator> frame_generator;
+    std::unique_ptr<FgMotionCapture> scene_motion_capture;
+    SceneCaptureStamp scene_capture_stamp{};
     void Run();
     void RunScaled();
+    void GenerateScaledFrame(vk::ImageView depth, u32 width, u32 height,
+                             float frame_ms, bool reset);
     void RunUiOnly(VideoCore::ImageId color, VideoCore::ImageId depth);
     void EnsureUiResources(u32 width, u32 height, vk::Format color, vk::Format depth);
     void PrepareUiDepth(VideoCore::ImageId depth);
@@ -225,6 +251,7 @@ private:
     std::array<float, 2> jitter{};
     u32 jitter_index = 0;
     bool reset = true;
+    int pending_blur_display = -1;
     u64 frame_id = 0;
     std::chrono::steady_clock::time_point last_frame{};
 

@@ -122,6 +122,12 @@ public:
     ~PipelineCache();
 
     void WarmUp();
+    /// Read-only inspection for cache regression checks, before any gameplay draws.
+    std::pair<size_t, size_t> GraphicsPipelineCounts() const {
+        size_t motion = 0;
+        for (const auto& [key, pipeline] : graphics_pipelines) motion += key.motion_vectors;
+        return {graphics_pipelines.size(), motion};
+    }
     /// bbport: writes the Vulkan driver's pipeline cache (compiled GPU code) beside the shader
     /// cache, in the background; loaded at the next start so known pipelines skip the driver's
     /// compiler. Called after the warm-up, every few new pipelines and at shutdown.

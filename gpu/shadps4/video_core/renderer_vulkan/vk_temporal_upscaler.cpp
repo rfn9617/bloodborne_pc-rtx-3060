@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
+#include "video_core/renderer_vulkan/vk_frame_generator.h"
+#include "video_core/renderer_vulkan/vk_fg_motion_capture.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "video_core/renderer_vulkan/motion_history.h"
+#include "video_core/renderer_vulkan/blur_snapshot_budget.h"
+#include "video_core/renderer_vulkan/light_capture_budget.h"
+#include "video_core/renderer_vulkan/glow_capture_budget.h"
 #include "video_core/renderer_vulkan/vk_scene_resolution.h"
 #include "video_core/renderer_vulkan/ui_composition.h"
 
@@ -11,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <utility>
 
 #include <vk_mem_alloc.h>
 
@@ -38,6 +44,30 @@ namespace Vulkan {
 
 namespace {
 
+bool LightDiagnosticsEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("BB_LIGHT_DIAGNOSTICS");
+        return value && value[0] == '1';
+    }();
+    return enabled && BbStats::BlurDiagnosticsEnabled();
+}
+
+bool LightHdrDiagnosticsEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("BB_LIGHT_HDR_DIAGNOSTICS");
+        return value && value[0] == '1';
+    }();
+    return enabled && LightDiagnosticsEnabled();
+}
+
+bool PostprocessDiagnosticsEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("BB_POSTPROCESS_DIAGNOSTICS");
+        return value && value[0] == '1';
+    }();
+    return enabled && BbStats::BlurDiagnosticsEnabled() && !LightDiagnosticsEnabled();
+}
+
 FfxVkPortableImage Describe(vk::Image image, vk::Format format, u32 width, u32 height,
                             vk::ImageUsageFlags usage, vk::ImageAspectFlags aspect,
                             FfxVkPortableResourceState state) {
@@ -59,6 +89,21 @@ FfxVkPortableImage Describe(vk::Image image, vk::Format format, u32 width, u32 h
 /// <dir>/fNNN_<name>_<w>x<h>_<format>.raw, for checking temporal stability offline.
 /// Returns the frame number to dump, or -1.
 int DumpFrame() {
+    if (LightDiagnosticsEnabled()) {
+        static LightCaptureBudget budget;
+        const int frame = budget.Consume(BbStats::blur_snapshot_seq.load(std::memory_order_relaxed),
+                                         LightCaptureBudget::Clock::now());
+        if (frame >= 0) std::printf("Light capture: pair %d/%u, %lld ms since request\n",
+                                    frame + 1, LightCaptureBudget::Limit,
+                                    budget.ElapsedMilliseconds());
+        return frame;
+    }
+    if (BbStats::BlurDiagnosticsEnabled()) {
+        static BlurSnapshotBudget budget;
+        const int frame = budget.Consume(BbStats::blur_snapshot_seq.load(std::memory_order_relaxed));
+        if (frame >= 0) std::printf("Blur snapshot %d: single-frame stage capture\n", frame + 1);
+        return frame;
+    }
     static const char* trigger = std::getenv("BB_DUMP_TRIGGER");
     static int remaining = 0, index = 0, polls = 0;
     // F10 (BB_FRAME_PICTURES): two frames, numbered on from earlier snapshots.
@@ -100,6 +145,16 @@ struct DumpImage {
 /// files once the GPU is done.
 void DumpImages(const Instance& instance, Scheduler& scheduler, vk::CommandBuffer cmdbuf,
                 int frame, std::initializer_list<DumpImage> images) {
+    const bool lights = LightDiagnosticsEnabled();
+    const auto wanted = [](const DumpImage& image) {
+        if (LightHdrDiagnosticsEnabled()) {
+            return std::strcmp(image.name, "hdr_scene") == 0 ||
+                   std::strcmp(image.name, "scene_depth") == 0 ||
+                   std::strcmp(image.name, "input") == 0;
+        }
+        return std::strcmp(image.name, "input") == 0 || std::strcmp(image.name, "output") == 0;
+    };
+    if (lights && std::none_of(images.begin(), images.end(), wanted)) return;
     static const std::string dir = [] {
         const char* env = std::getenv("BB_DUMP_DIR");
         return std::string{env && env[0] ? env : "out/dump"};
@@ -112,7 +167,20 @@ void DumpImages(const Instance& instance, Scheduler& scheduler, vk::CommandBuffe
     };
     cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &before});
     for (const auto& image : images) {
-        const VkDeviceSize size = VkDeviceSize(image.width) * image.height * image.bytes_per_pixel;
+        if (lights && !wanted(image)) continue;
+        // The upper central scene contains the wall lights from the Mensis recording.
+        // Copy a region, without rescaling: preserve the exact pixels at both taps.
+        const bool roi = LightHdrDiagnosticsEnabled();
+        const u32 copy_width = roi ? std::min(640u, image.width) : image.width;
+        const u32 copy_height = roi ? std::min(360u, image.height) : image.height;
+        const u32 copy_x = roi ? (image.width - copy_width) / 2 : 0;
+        const VkDeviceSize size = VkDeviceSize(copy_width) * copy_height * image.bytes_per_pixel;
+        static VkDeviceSize blur_dump_bytes = 0;
+        constexpr VkDeviceSize BlurDumpLimit = 256ull << 20;
+        if (BbStats::BlurDiagnosticsEnabled() && size > BlurDumpLimit - blur_dump_bytes) {
+            std::printf("Blur dump: skipped %s, 256 MiB process budget reached\n", image.name);
+            continue;
+        }
         const VkBufferCreateInfo buffer_ci{
             .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
             .size = size,
@@ -131,14 +199,19 @@ void DumpImages(const Instance& instance, Scheduler& scheduler, vk::CommandBuffe
             std::printf("Dump: no host memory for %s\n", image.name);
             continue;
         }
+        if (BbStats::BlurDiagnosticsEnabled()) blur_dump_bytes += size;
         const vk::BufferImageCopy region{
             .imageSubresource = {image.aspect, 0, 0, 1},
-            .imageExtent = {image.width, image.height, 1},
+            .imageOffset = {s32(copy_x), 0, 0},
+            .imageExtent = {copy_width, copy_height, 1},
         };
         cmdbuf.copyImageToBuffer(image.image, vk::ImageLayout::eGeneral, buffer, region);
         char path[512];
         std::snprintf(path, sizeof(path), "%s/f%03d_%s_%ux%u_%s.raw", dir.c_str(), frame,
-                      image.name, image.width, image.height, image.format);
+                      image.name, copy_width, copy_height, image.format);
+        if (roi) std::printf("Glow ROI: sample %d stage %s x %u y 0 size %ux%u source %ux%u\n",
+                            frame, image.name, copy_x, copy_width, copy_height,
+                            image.width, image.height);
         scheduler.DeferPriorityOperation(
             [allocator = instance.GetAllocator(), buffer, allocation, info, size,
              file = std::string{path}] {
@@ -189,6 +262,11 @@ TemporalUpscaler::TemporalUpscaler(const Instance& instance_, Scheduler& schedul
         BbSettings::ConfigureDlssSupport(dlss && dlss->Available(), problem.c_str());
     }
     // Available unless BB_UPSCALER=none; on/off and the parameters are the menu's settings.
+    frame_generator = std::make_unique<FrameGenerator>(instance, scheduler);
+    if (const char* stages=std::getenv("BB_SCENE_MOTION_CAPTURE");
+        stages && stages[0]=='1' && FgMotionCapture::Requested()) {
+        scene_motion_capture=std::make_unique<FgMotionCapture>(instance,scheduler,true);
+    }
     const char* env = std::getenv("BB_UPSCALER");
     enabled = !(env && std::strcmp(env, "none") == 0);
     if (const char* hash = std::getenv("BB_UPSCALE_BEFORE_CS")) {
@@ -235,6 +313,7 @@ TemporalUpscaler::TemporalUpscaler(const Instance& instance_, Scheduler& schedul
 }
 
 TemporalUpscaler::~TemporalUpscaler() {
+    scene_motion_capture.reset();
     if (resources_ready) scheduler.Finish();
     if (context) {
         scheduler.Finish();
@@ -282,6 +361,10 @@ bool TemporalUpscaler::RasterScaling() const {
 }
 
 bool TemporalUpscaler::OnFrameStart() {
+    light_hdr_dump = -1; // Never pair an old HDR capture with a later frame's LDR.
+    postprocess_budget.End();
+    ++light_frame_serial;
+    frame_generator->Boundary();
     TrackLoadingScreen();
     ReportDlssFrame();
     frame_triggered = frame_invalid_input = false;
@@ -377,6 +460,7 @@ bool TemporalUpscaler::OnFrameStart() {
 }
 
 void TemporalUpscaler::OnDispatch(u64 cs_hash) {
+    if (cs_hash == trigger_hash && (LightHdrDiagnosticsEnabled() || PostprocessDiagnosticsEnabled())) CaptureLightHdr();
     if (cs_hash == trigger_hash) frame_triggered = true;
     if (cs_hash != trigger_hash || done_this_frame || failed || Scaled()) {
         return;
@@ -387,6 +471,47 @@ void TemporalUpscaler::OnDispatch(u64 cs_hash) {
         return;
     }
     Run();
+}
+
+void TemporalUpscaler::CaptureLightHdr() {
+    // This diagnostic currently targets the startup-patched Quality path, whose HDR and
+    // depth images have the same actual size. Do not silently read native-size proxies.
+    if (!Scaled() || failed || done_this_frame || light_hdr_dump >= 0 || !scene_color ||
+        !camera_motion.Depth()) return;
+    auto& color = texture_cache.GetImage(scene_color);
+    auto& depth = texture_cache.GetImage(camera_motion.Depth());
+    const auto w = color.info.size.width, h = color.info.size.height;
+    if (color.info.pixel_format != vk::Format::eR16G16B16A16Sfloat ||
+        w != depth.info.size.width || h != depth.info.size.height ||
+        !RenderTarget(w, h) ||
+        !(color.usage_flags & vk::ImageUsageFlagBits::eTransferSrc) ||
+        !(depth.usage_flags & vk::ImageUsageFlagBits::eTransferSrc) ||
+        depth.backing->image.image_ci.format != vk::Format::eD32SfloatS8Uint) return;
+    static GlowCaptureBudget budget;
+    const u32 request = BbStats::blur_snapshot_seq.load(std::memory_order_relaxed);
+    const int dump = PostprocessDiagnosticsEnabled()
+        ? postprocess_budget.Begin(request, light_frame_serial)
+        : budget.Consume(request, light_frame_serial);
+    if (dump < 0) return;
+    scheduler.EndRendering();
+    runtime.Transit(&color, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eTransfer,
+                    vk::AccessFlagBits2::eTransferRead);
+    runtime.Transit(&depth, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eTransfer,
+                    vk::AccessFlagBits2::eTransferRead);
+    runtime.FlushBarriers();
+    DumpImages(instance, scheduler, scheduler.CommandBuffer(), dump,
+               {{color.GetImage(), w, h, 8, "hdr_scene", "rgba16f"},
+                {depth.GetImage(), w, h, 4, "scene_depth", "f32", vk::ImageAspectFlagBits::eDepth}});
+    light_hdr_dump = dump;
+    if (PostprocessDiagnosticsEnabled()) {
+        FrameCapture::BeginPostprocessSnapshot(request, light_frame_serial);
+        std::printf("Postprocess begin: snapshot %d request %u frame %llu\n", dump, request,
+                    (unsigned long long)light_frame_serial);
+    }
+    std::printf("Light HDR: sample %d frame %llu color %#llx depth %#llx %ux%u before guest post\n",
+                dump, (unsigned long long)light_frame_serial,
+                (unsigned long long)color.info.guest_address,
+                (unsigned long long)depth.info.guest_address, w, h);
 }
 
 bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
@@ -462,7 +587,9 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
         .arrayLayers = 1,
         .samples = vk::SampleCountFlagBits::e1,
         .tiling = vk::ImageTiling::eOptimal,
-        .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled,
+        .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled |
+            ([] {const char* v=std::getenv("BB_FG_MOTION_CAPTURE");return v && v[0]=='1'
+                ? vk::ImageUsageFlags(vk::ImageUsageFlagBits::eTransferSrc):vk::ImageUsageFlags{};}()),
         .initialLayout = vk::ImageLayout::eUndefined,
     });
     output_image = VideoCore::UniqueImage(device, allocator);
@@ -1096,6 +1223,7 @@ void TemporalUpscaler::Run() {
         failed = true;
         return;
     }
+    if (FrameGenerator::Requested()) frame_generator->Prepare(w,h);
     const auto depth_format = depth.info.pixel_format;
     const auto depth_view =
         CachedView(depth, depth_format, vk::ImageAspectFlagBits::eDepth);
@@ -1162,6 +1290,7 @@ void TemporalUpscaler::Run() {
     }
     last_frame = now;
 
+    const bool fg_reset = reset;
     bool dispatched = false;
     if (BbSettings::Get().upscaler == BbSettings::UpscalerTaa) {
         RecordTaa(cmdbuf, input_color_view, input_depth_view);
@@ -1245,9 +1374,24 @@ void TemporalUpscaler::Run() {
         }
     }
     if (dispatched) {
+        if (FrameGenerator::Requested()) {
+            frame_generator->Inputs(input_depth_view,vk::Image(motion_image),w,h,
+                camera_motion.Near(),camera_motion.VerticalFov(),jitter,
+                camera_motion.FrameGenerationCamera(),frame_ms,fg_reset);
+        }
         reset = false;
         dispatched_last_frame = true;
         if (const int dump = DumpFrame(); dump >= 0) {
+            if (BbStats::BlurDiagnosticsEnabled()) {
+                if (!LightDiagnosticsEnabled()) pending_blur_display = dump;
+                std::printf("Blur stages: snapshot %d, HDR, color uid %llu address %#llx, "
+                            "depth uid %llu address %#llx; render %ux%u -> %ux%u; reset %d\n",
+                            dump + 1, (unsigned long long)color.image_uid,
+                            (unsigned long long)color.info.guest_address,
+                            (unsigned long long)depth.image_uid,
+                            (unsigned long long)depth.info.guest_address, w, h, ow, oh, fg_reset);
+                camera_motion.ReportBlurState();
+            }
             DumpImages(instance, scheduler, cmdbuf, dump,
                        {{input_color, w, h, 8, "input", "rgba16f"},
                         {vk::Image(motion_image), w, h, 4, "motion", "rg16f"},
@@ -1381,6 +1525,41 @@ bool TemporalUpscaler::Scaled() const {
     return scaled_session || target_width != 1920 || target_height != 1080;
 }
 
+void TemporalUpscaler::CapturePostprocessDraw(u64 ps_hash, VideoCore::ImageId color_id) {
+    if (!PostprocessDiagnosticsEnabled() || light_hdr_dump < 0 || !color_id || done_this_frame) return;
+    // Fullscreen stages observed in the command-stream capture, including the
+    // repeated half-size filters. Unknown shaders remain visible in metadata.
+    switch (ps_hash) {
+    case 0xccbf44a6: case 0x5c02eaf8: case 0xed4c7668: case 0x57f3b8c2:
+    case 0xf7229091: case 0xa61e325d: case 0x8c08444c: break;
+    default: return;
+    }
+    auto& image = texture_cache.GetImage(color_id);
+    const auto w = image.info.size.width, h = image.info.size.height;
+    const auto format = image.info.pixel_format;
+    const bool hdr = format == vk::Format::eR16G16B16A16Sfloat;
+    if (!hdr && format != vk::Format::eR8G8B8A8Unorm && format != vk::Format::eR8G8B8A8Srgb) return;
+    const auto& ci = image.backing->image.image_ci;
+    if (!w || !h || w > render_width + 8 || h > render_height + 8 ||
+        ci.samples != vk::SampleCountFlagBits::e1 || ci.arrayLayers != 1 || ci.extent.depth != 1 ||
+        !(image.usage_flags & vk::ImageUsageFlagBits::eTransferSrc)) return;
+    const int stage = postprocess_budget.NextStage(light_frame_serial);
+    if (stage < 0) return;
+    char name[32];
+    std::snprintf(name, sizeof(name), "post_%02d", stage);
+    scheduler.EndRendering();
+    runtime.Transit(&image, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eTransfer,
+                    vk::AccessFlagBits2::eTransferRead);
+    runtime.FlushBarriers();
+    DumpImages(instance, scheduler, scheduler.CommandBuffer(), light_hdr_dump,
+               {{image.GetImage(), w, h, hdr ? 8u : 4u, name, hdr ? "rgba16f" : "rgba"}});
+    std::printf("Postprocess stage: snapshot %d frame %llu stage %d ps %08llx uid %llu "
+                "address %#llx size %ux%u format %s\n", light_hdr_dump,
+                (unsigned long long)light_frame_serial, stage, (unsigned long long)ps_hash,
+                (unsigned long long)image.image_uid, (unsigned long long)image.info.guest_address,
+                w, h, vk::to_string(format).c_str());
+}
+
 void TemporalUpscaler::OnColorTarget(VideoCore::ImageId color) {
     if (ui_phase || !camera_motion.Depth()) {
         return;
@@ -1396,7 +1575,22 @@ void TemporalUpscaler::OnColorTarget(VideoCore::ImageId color) {
 
 void TemporalUpscaler::OnDraw(u64 vs_hash, VideoCore::ImageId color,
                               VideoCore::ImageId depth, bool native_viewport) {
-    if (!Scaled() && vs_hash == ui_trigger_vs) done_this_frame = true;
+    if (!Scaled() && vs_hash == ui_trigger_vs) {
+        done_this_frame = true;
+        if (FrameGenerator::Requested() && color) {
+            auto& image=texture_cache.GetImage(color);
+            if (image.info.pixel_format==vk::Format::eR8G8B8A8Unorm &&
+                image.info.size.width==1920 && image.info.size.height==1080) {
+                VideoCore::ImageViewInfo view;
+                view.format=vk::Format::eR8G8B8A8Unorm;
+                runtime.Transit(&image,vk::ImageLayout::eGeneral,
+                    vk::PipelineStageFlagBits2::eComputeShader,vk::AccessFlagBits2::eShaderRead);
+                runtime.FlushBarriers();
+                frame_generator->CaptureScene(*image.FindView(view).image_view,
+                    vk::ImageLayout::eGeneral,1920,1080);
+            }
+        }
+    }
     if (!Scaled() || !color) {
         return;
     }
@@ -1641,6 +1835,11 @@ void TemporalUpscaler::RunScaled() {
         return;
     }
     EnsureUiResources(ow, oh, color.info.pixel_format, depth.info.pixel_format);
+    // Quality uses this LDR/native-UI route, rather than the HDR Native AA route.
+    // Creation may finish the scheduler, so do it before retaining a command buffer.
+    if (FrameGenerator::Requested() && ow == 1920 && oh == 1080) {
+        frame_generator->Prepare(w, h);
+    }
     PrepareUiDepth(camera_motion.Depth());
     const auto depth_format = depth.info.pixel_format;
     // Views kept across frames: FSR 4 registers images by view in a registry of eight.
@@ -1711,6 +1910,7 @@ void TemporalUpscaler::RunScaled() {
     last_frame = now;
 
     // bbport: FSR 4 writes its HDR-format output, copied into the output-size UI image.
+    const bool fg_reset = reset;
     if (UseFsr4() || UseDlss() || BbSettings::Get().upscaler == BbSettings::UpscalerTaa) {
         barrier(vk::Image(output_image), vk::ImageAspectFlagBits::eColor,
                 vk::ImageLayout::eUndefined, all, vk::AccessFlagBits2::eNone,
@@ -1776,16 +1976,59 @@ void TemporalUpscaler::RunScaled() {
                         vk::AccessFlagBits2::eTransferWrite, vk::ImageLayout::eGeneral,
                         vk::PipelineStageFlagBits2::eColorAttachmentOutput, color_access);
             }
+            if (scene_motion_capture) {
+                auto inputs=frame_generator->GetDiagnosticInputs();
+                // These stages precede GenerateFinal's ID increment for this scene.
+                inputs.frame_id=FrameGenerator::Requested()?inputs.frame_id+1:scene_capture_stamp.frame_id+1;
+                inputs.frame_ms=frame_ms; inputs.jitter=jitter;
+                scene_capture_stamp={inputs.frame_id,frame_ms,jitter};
+                scene_motion_capture->RecordScene(cmdbuf,
+                    {color_image,vk::ImageLayout::eGeneral,w,h,
+                     color.info.pixel_format,"scene_input"},
+                    {vk::Image(output_image),vk::ImageLayout::eGeneral,ow,oh,
+                     vk::Format::eR16G16B16A16Sfloat,"scene_output"},
+                    {depth_image,vk::ImageLayout::eGeneral,w,h,
+                     depth_format,"scene_depth",vk::ImageAspectFlagBits::eDepth},
+                    {vk::Image(motion_image),vk::ImageLayout::eGeneral,w,h,
+                     vk::Format::eR16G16Sfloat,"scene_motion"},inputs);
+            }
+            GenerateScaledFrame(depth_view, w, h, frame_ms, fg_reset);
             reset = false;
             dispatched_last_frame = true;
-            if (const int dump = DumpFrame(); dump >= 0) {
-                DumpImages(instance, scheduler, cmdbuf, dump,
-                           {{color_image, source_width, source_height, 4, "input", "rgba"},
-                            {vk::Image(motion_image), w, h, 4, "motion", "rg16f"},
-                            {vk::Image(output_image), ow, oh, 8, "output", "rgba16f"}});
-                DumpImages(instance, scheduler, cmdbuf, dump,
-                           {{depth_image, source_width, source_height, 4, "depth", "f32",
-                             vk::ImageAspectFlagBits::eDepth}});
+            if (const int dump = (LightHdrDiagnosticsEnabled() || PostprocessDiagnosticsEnabled())
+                                     ? std::exchange(light_hdr_dump, -1) : DumpFrame(); dump >= 0) {
+                if (PostprocessDiagnosticsEnabled()) {
+                    postprocess_budget.End();
+                    std::printf("Postprocess LDR: snapshot %d frame %llu\n", dump,
+                                (unsigned long long)light_frame_serial);
+                }
+                if (LightHdrDiagnosticsEnabled()) {
+                    std::printf("Light LDR: sample %d frame %llu after guest post, before DLSS\n",
+                                dump, (unsigned long long)light_frame_serial);
+                }
+                if (BbStats::BlurDiagnosticsEnabled()) {
+                    if (!LightDiagnosticsEnabled()) pending_blur_display = dump;
+                    std::printf("Blur stages: snapshot %d, LDR, color uid %llu address %#llx, "
+                                "depth uid %llu address %#llx; render %ux%u -> %ux%u; reset %d\n",
+                                dump + 1, (unsigned long long)color.image_uid,
+                                (unsigned long long)color.info.guest_address,
+                                (unsigned long long)depth.image_uid,
+                                (unsigned long long)depth.info.guest_address, w, h, ow, oh, fg_reset);
+                    camera_motion.ReportBlurState();
+                }
+                if (PostprocessDiagnosticsEnabled()) {
+                    DumpImages(instance, scheduler, cmdbuf, dump,
+                               {{color_image, source_width, source_height, 4, "input", "rgba"},
+                                {vk::Image(output_image), ow, oh, 8, "output", "rgba16f"}});
+                } else {
+                    DumpImages(instance, scheduler, cmdbuf, dump,
+                               {{color_image, source_width, source_height, 4, "input", "rgba"},
+                                {vk::Image(motion_image), w, h, 4, "motion", "rg16f"},
+                                {vk::Image(output_image), ow, oh, 8, "output", "rgba16f"}});
+                    DumpImages(instance, scheduler, cmdbuf, dump,
+                               {{depth_image, source_width, source_height, 4, "depth", "f32",
+                                 vk::ImageAspectFlagBits::eDepth}});
+                }
                 if (BbSettings::Get().upscaler == BbSettings::UpscalerTaa &&
                     std::getenv("BB_TAA_DIAGNOSTICS")) {
                     DumpImages(instance, scheduler, cmdbuf, dump,
@@ -1795,7 +2038,8 @@ void TemporalUpscaler::RunScaled() {
                 }
                 // ObjectMotion's attachment can be in a different resolution from the FSR
                 // inputs: only dump it when it matches, to avoid an out-of-bounds GPU copy.
-                if (const auto object = camera_motion.ObjectMotionImage(w, h); object) {
+                if (const auto object = camera_motion.ObjectMotionImage(w, h);
+                    object && !PostprocessDiagnosticsEnabled()) {
                     DumpImages(instance, scheduler, cmdbuf, dump,
                                {{object, w, h, 16, "objects", "rgba32f"}});
                 }
@@ -1858,6 +2102,9 @@ void TemporalUpscaler::RunScaled() {
     create_info.structSize = sizeof(create_info);
     create_info.maxRenderSize = {w, h};
     create_info.maxOutputSize = {ow, oh};
+    // FSR 3 previously inherited the motion-vector segment's label, making its
+    // reconstruction cost look like expensive motion preparation in GPU profiles.
+    mark("upscaler 3: FSR 3.1 + sharpen");
     bool ok = false;
     if (const u64 issues = ffxVkPortableValidateUpscaleDispatchInfo(&create_info, &info)) {
         PrintIssues("scaled dispatch", issues);
@@ -1877,10 +2124,84 @@ void TemporalUpscaler::RunScaled() {
 
     done_this_frame = true; // the UI is not jittered
     if (ok) {
+        GenerateScaledFrame(depth_view, w, h, frame_ms, info.reset);
         ui_phase = true;
         ui_color = ldr_target;
         ui_depth = camera_motion.Depth();
     }
+}
+
+void TemporalUpscaler::GenerateScaledFrame(vk::ImageView depth, u32 w, u32 h,
+                                          float frame_ms, bool history_reset) {
+    if (!FrameGenerator::Requested() || ui_width != 1920 || ui_height != 1080 ||
+        !frame_generator->HasHistory()) {
+        return;
+    }
+    scheduler.EndRendering();
+    const auto cmd = scheduler.CommandBuffer();
+    const vk::ImageMemoryBarrier2 to_read{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+        .oldLayout = vk::ImageLayout::eGeneral, .newLayout = vk::ImageLayout::eGeneral,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = vk::Image(ui_image),
+        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+    };
+    cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_read});
+    frame_generator->Inputs(depth, vk::Image(motion_image), w, h,
+        camera_motion.Near(), camera_motion.VerticalFov(), jitter,
+        camera_motion.FrameGenerationCamera(), frame_ms, history_reset);
+    static bool reported = false;
+    if (!reported) {
+        std::printf("Frame generation inputs: LDR reconstruction %ux%u -> %ux%u, capture before native UI\n",
+                    w, h, ui_width, ui_height);
+        reported = true;
+    }
+    // Preserve a pre-UI reference only. FI/OF dispatch uses the finished display in Presenter.
+    frame_generator->CaptureScene(Mirror(vk::Image(ui_image), ui_views,
+        vk::Format::eR8G8B8A8Unorm, {}), vk::ImageLayout::eGeneral, ui_width, ui_height);
+    auto to_ui = to_read;
+    to_ui.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+    to_ui.srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+    to_ui.dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput;
+    to_ui.dstAccessMask = vk::AccessFlagBits2::eColorAttachmentRead |
+                         vk::AccessFlagBits2::eColorAttachmentWrite;
+    cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_ui});
+}
+
+vk::ImageView TemporalUpscaler::HudlessDisplaySample(vk::ImageView ui_view) {
+    if(!display_redirect || !FrameGenerator::Requested()) return {};
+    for(const auto& view:ui_views) if(*view.view==ui_view)
+        return frame_generator->CleanView(view.format,view.mapping);
+    return {};
+}
+
+TemporalUpscaler::Target TemporalUpscaler::FrameGenerationUiFrame() {
+    if (!FrameGenerator::Requested() || !display_redirect || !ui_image ||
+        ui_width != 1920 || ui_height != 1080) {
+        return {};
+    }
+    // Compare against the exact image that received the native UI. The subsequent
+    // display shader may filter/round pixels; that must not mark the entire scene as UI.
+    scheduler.EndRendering();
+    const vk::ImageMemoryBarrier2 barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+        .oldLayout = vk::ImageLayout::eGeneral, .newLayout = vk::ImageLayout::eGeneral,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = vk::Image(ui_image),
+        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+    };
+    scheduler.CommandBuffer().pipelineBarrier2({.imageMemoryBarrierCount = 1,
+                                               .pImageMemoryBarriers = &barrier});
+    return {Mirror(vk::Image(ui_image), ui_views, vk::Format::eR8G8B8A8Unorm, {}),
+            vk::ImageLayout::eGeneral, ui_width, ui_height};
 }
 
 vk::ImageView TemporalUpscaler::Mirror(vk::Image image, std::vector<MirrorView>& views,
@@ -2064,7 +2385,7 @@ bool TemporalUpscaler::RecordFsr4(vk::CommandBuffer cmdbuf, Fsr4Upscaler::Image 
         .output = {vk::Image(output_image), *output_view, ow, oh},
         .render_width = w,
         .render_height = h,
-        .preset = applied_preset,
+        .preset = applied_preset == BbSettings::UltraQuality ? BbSettings::Quality : applied_preset,
         .jitter = {sign * jitter[0], sign * jitter[1]},
         .frame_ms = frame_ms,
         .near_plane = camera_motion.Near(),
@@ -2203,7 +2524,8 @@ void TemporalUpscaler::TrackLoadingScreen() {
 }
 
 void TemporalUpscaler::ReportDlssFrame() {
-    if (!BbStats::enabled || applied_upscaler != BbSettings::UpscalerDlss) return;
+    if ((!BbStats::enabled && !BbStats::BlurDiagnosticsEnabled()) ||
+        applied_upscaler != BbSettings::UpscalerDlss) return;
     ++dlss_stats.frames;
     const bool scene = scene_color || camera_motion.Depth();
     if (scene) {
@@ -2232,7 +2554,62 @@ void TemporalUpscaler::ReportDlssFrame() {
                 (unsigned long long)BbStats::camera_snapshots.exchange(0),
                 (unsigned long long)BbStats::camera_guest_changed.exchange(0));
     dlss_report_time = now;
+    if (BbStats::BlurDiagnosticsEnabled()) {
+        static const auto started = now;
+        VmaBudget budgets[VK_MAX_MEMORY_HEAPS]{};
+        vmaGetHeapBudgets(instance.GetAllocator(), budgets);
+        const auto properties = instance.GetPhysicalDevice().getMemoryProperties();
+        u64 blocks = 0, allocations = 0, driver_usage = 0, driver_budget = 0;
+        for (u32 heap = 0; heap < properties.memoryHeapCount; ++heap) {
+            if (!(properties.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal)) continue;
+            blocks += budgets[heap].statistics.blockBytes;
+            allocations += budgets[heap].statistics.allocationBytes;
+            driver_usage += budgets[heap].usage;
+            driver_budget += budgets[heap].budget;
+        }
+        std::printf("Blur session: %.1f s, reset next %d, HDR %d; device-local allocator "
+                    "blocks %.1f MiB, live %.1f MiB; VMA estimate %.1f/%.1f MiB\n",
+                    std::chrono::duration<double>(now - started).count(), reset, context_hdr,
+                    blocks / 1048576.0, allocations / 1048576.0,
+                    driver_usage / 1048576.0, driver_budget / 1048576.0);
+        if (instance.CanReportMemoryUsage()) {
+            std::printf("Blur driver memory: usage %.1f MiB, budget %.1f MiB "
+                        "(VK_EXT_memory_budget, includes allocations outside VMA)\n",
+                        instance.GetDeviceMemoryUsage() / 1048576.0,
+                        instance.GetDeviceMemoryBudgetNow() / 1048576.0);
+        } else {
+            std::puts("Blur driver memory: VK_EXT_memory_budget unavailable; VMA estimate only");
+        }
+        camera_motion.ReportBlurState();
+    }
     dlss_stats = {};
+}
+
+void TemporalUpscaler::CaptureBlurDisplay(VideoCore::ImageId frame) {
+    if (pending_blur_display < 0 || !frame) return;
+    const int snapshot = std::exchange(pending_blur_display, -1);
+    auto& image = texture_cache.GetImage(frame);
+    const auto format = image.info.pixel_format;
+    const bool bgra = format == vk::Format::eB8G8R8A8Unorm || format == vk::Format::eB8G8R8A8Srgb;
+    if (!bgra && format != vk::Format::eR8G8B8A8Unorm && format != vk::Format::eR8G8B8A8Srgb) {
+        std::printf("Blur final: snapshot %d skipped, unsupported format %s\n",
+                    snapshot + 1, vk::to_string(format).c_str());
+        return;
+    }
+    scheduler.EndRendering();
+    const bool redirected = ui_phase && frame == ui_color;
+    vk::Image source = redirected ? vk::Image(ui_image) : image.GetImage();
+    const u32 w = redirected ? ui_width : image.info.size.width;
+    const u32 h = redirected ? ui_height : image.info.size.height;
+    if (!redirected) {
+        runtime.Transit(&image, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eTransfer,
+                        vk::AccessFlagBits2::eTransferRead);
+        runtime.FlushBarriers();
+    }
+    std::printf("Blur final: snapshot %d, image uid %llu, %ux%u, redirected %d\n",
+                snapshot + 1, (unsigned long long)image.image_uid, w, h, redirected);
+    DumpImages(instance, scheduler, scheduler.CommandBuffer(), snapshot,
+               {{source, w, h, 4, "final", bgra ? "bgra" : "rgba"}});
 }
 
 } // namespace Vulkan

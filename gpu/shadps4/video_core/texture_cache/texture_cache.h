@@ -372,6 +372,7 @@ private:
     void UntrackImageTail(ImageId image_id);
 
     void MarkAsMaybeDirty(ImageId image_id, Image& image);
+    static u64 MaybeDirtyHash(const Image& image);
 
     /// Removes the image and any views/surface metas that reference it.
     void DeleteImage(ImageId image_id);
@@ -423,6 +424,8 @@ private:
     Common::LeastRecentlyUsedCache<ImageId, u64> lru_cache;
     Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
     const bool readback_linear_images;
+    // Diagnostic isolation of upstream initial-upload hashing; old behavior only with =0.
+    const bool upload_hash_baseline;
     PageTable page_table;
     std::mutex mutex;
     // bbport: FindImage results for unchanged image registrations (guarded by `mutex`).

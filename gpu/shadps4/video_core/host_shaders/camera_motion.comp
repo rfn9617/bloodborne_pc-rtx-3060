@@ -24,7 +24,7 @@ layout(push_constant) uniform Constants {
     vec2 size;         // pixels
     vec2 jitter;       // current viewport shift in render pixels (x right, y down)
     vec2 previous_jitter;
-    uint mode;         // motion: 1 = object motion vectors available; debug: 0 motion, 1 raw
+    uint mode;         // motion bits: 1 = object available, 2 = history guard; debug: 0 motion, 1 raw
                        // depth, 2 view z / 50, 3 reprojected previous frame, 4 |difference|
 };
 
@@ -88,14 +88,21 @@ void main() {
     imageStore(color_img, pixel, vec4(mix(current.rgb, mv_color, 0.75), current.a));
 #else
     vec2 result = motion;
-    if (mode == 1) {
+    if ((mode & 1u) != 0u) {
         const vec4 object_motion = texelFetch(object_tex, pixel, 0);
         // A later ordinary draw may have covered this pixel without touching the motion
         // target. Its final depth then differs from the depth stored with the vector.
         // Both depths are full precision. Do not accept an old foreground vector merely
         // because perspective depth compresses distant surfaces into a small interval.
         float depth_threshold = max(2e-7, (proj.z - depth) * 0.01);
-        if (object_motion.b > 0.99 && abs(object_motion.a - depth) < depth_threshold &&
+        // Shared meshes can be matched to another instance when the draw order
+        // changes. Depth agreement alone cannot identify that wrong history.
+        // Reject a very large object-relative jump; retain the exact camera
+        // reprojection rather than clamp the vector or turn off object motion.
+        const vec2 relative = object_motion.rg - motion;
+        const float limit = max(128.0, max(size.x, size.y) * 0.1);
+        const bool trusted = (mode & 2u) == 0u || dot(relative, relative) <= limit * limit;
+        if (trusted && object_motion.b > 0.99 && abs(object_motion.a - depth) < depth_threshold &&
             !any(isnan(object_motion.rg)) &&
             !any(isinf(object_motion.rg))) {
             result = object_motion.rg;

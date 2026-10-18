@@ -4,11 +4,22 @@
 // sizes in dwords, relative to the bound ranges of the source and destination buffers.
 #version 450
 
-layout(local_size_x = 64) in;
+#ifndef GROUP_SIZE
+#define GROUP_SIZE 64
+#endif
+#ifndef VECTOR_COPY
+#define VECTOR_COPY 0
+#endif
+layout(local_size_x = GROUP_SIZE) in;
 
 layout(std430, binding = 0) readonly buffer Source { uint src[]; };
 layout(std430, binding = 1) writeonly buffer Destination { uint dst[]; };
 layout(std430, binding = 2) readonly buffer Regions { uvec4 regions[]; }; // src, dst, dwords
+#if VECTOR_COPY
+// The same SSBO descriptors, with a 16-byte view for sufficiently large aligned ranges.
+layout(std430, binding = 0) readonly buffer Source4 { uvec4 src4[]; };
+layout(std430, binding = 1) writeonly buffer Destination4 { uvec4 dst4[]; };
+#endif
 
 layout(push_constant) uniform Push { uint count; } push;
 
@@ -18,7 +29,20 @@ void main() {
         return;
     }
     const uvec4 region = regions[index];
-    for (uint i = gl_LocalInvocationID.x; i < region.z; i += 64) {
+#if VECTOR_COPY
+    // Small / misaligned ranges keep the existing scalar path. Measurements on
+    // RTX 3060 show wider copies only help the larger aligned regions.
+    if (((region.x | region.y) & 3u) == 0u && region.z >= 256u) {
+        const uint whole = region.z / 4u;
+        for (uint i = gl_LocalInvocationID.x; i < whole; i += GROUP_SIZE)
+            dst4[region.y / 4u + i] = src4[region.x / 4u + i];
+        const uint tail = whole * 4u;
+        for (uint i = tail + gl_LocalInvocationID.x; i < region.z; i += GROUP_SIZE)
+            dst[region.y + i] = src[region.x + i];
+        return;
+    }
+#endif
+    for (uint i = gl_LocalInvocationID.x; i < region.z; i += GROUP_SIZE) {
         dst[region.y + i] = src[region.x + i];
     }
 }
